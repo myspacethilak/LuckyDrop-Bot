@@ -17,13 +17,11 @@ from aiogram.client.default import DefaultBotProperties
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 
-# Import config settings
+# Import all modules from their new locations
 from bot_config import (
     BOT_TOKEN, ADMIN_ID, MONGO_URI, MAIN_CHANNEL_ID, ADMIN_SECRET_CODE,
     IST_TIMEZONE, UTC_TIMEZONE
 )
-
-# Import other modules from new folder structure
 from db.db_access import init_db
 from handlers.user_commands import register_user_handlers, UserStates
 from handlers.admin_commands import register_admin_handlers, AdminStates
@@ -42,15 +40,12 @@ bot = Bot(token=BOT_TOKEN, default=default_properties)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Create routers
 user_router = Router(name="user_router")
 admin_router = Router(name="admin_router")
 
-# MongoDB client
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.lotterydb
 
-# Global variable to hold the pot scheduler task
 pot_scheduler_task = None
 
 def log_unhandled_exceptions(exctype, value, tb):
@@ -72,6 +67,24 @@ async def set_default_commands(bot: Bot):
         BotCommand(command="setupi", description="Set or update your UPI ID"),
     ]
     await bot.set_my_commands(commands)
+
+async def close_overdue_pots_on_startup(db, bot, ist_timezone: pytz.BaseTzInfo, utc_timezone: pytz.BaseTzInfo):
+    current_time_ist = datetime.now(ist_timezone)
+    pot_data = await get_current_pot(db, ist_timezone)
+
+    if pot_data and pot_data.get('status') == 'open':
+        pot_end_time_from_db = pot_data['end_time']
+        if pot_end_time_from_db.tzinfo is None:
+            pot_end_time_from_db = utc_timezone.localize(pot_end_time_from_db)
+
+        pot_end_time_ist = pot_end_time_from_db.astimezone(ist_timezone)
+
+        if pot_end_time_ist < current_time_ist:
+            logger.info(f"Found overdue pot {pot_data['_id']} (ends {pot_end_time_ist.strftime('%I:%M %p IST')}), closing it now.")
+            admin_id = ADMIN_ID
+            main_channel_id = MAIN_CHANNEL_ID
+            await close_pot_and_distribute_prizes(bot, db, admin_id, pot_data['_id'], main_channel_id=main_channel_id)
+
 
 async def on_startup(dispatcher: Dispatcher, bot: Bot):
     global pot_scheduler_task
@@ -105,19 +118,20 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot):
 
     await close_overdue_pots_on_startup(db, bot, IST_TIMEZONE, UTC_TIMEZONE)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', os.getenv('PORT', 8080))
-    await site.start()
 
-async def main():
-    server_task = asyncio.create_task(start_web_server())
-    polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
-    await asyncio.gather(server_task, polling_task)
+async def on_shutdown(dispatcher: Dispatcher, bot: Bot):
+    logger.info("Shutting down bot and cleaning up tasks...")
+    if pot_scheduler_task and not pot_scheduler_task.done():
+        pot_scheduler_task.cancel()
+        try:
+            await pot_scheduler_task
+            logger.info("Pot scheduler task was cancelled.")
+        except asyncio.CancelledError:
+            logger.info("Pot scheduler task was cancelled.")
 
+    db_client.close()
+    logger.info("MongoDB connection closed.")
+    logger.info("Bot shutdown complete.")
 
 if __name__ == '__main__':
     sys.excepthook = log_unhandled_exceptions
@@ -125,5 +139,4 @@ if __name__ == '__main__':
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    asyncio.run(main())
-    #hiiiii
+    asyncio.run(dp.start_polling(bot, skip_updates=True))

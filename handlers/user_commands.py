@@ -7,7 +7,8 @@ import re
 from functools import wraps
 from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageFont
+# NEW: The Pillow imports are now only in ticket.py, not here.
+# from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Router, types, F, Bot
 from aiogram.fsm.context import FSMContext
@@ -20,18 +21,17 @@ logger = logging.getLogger(__name__)
 
 from bot_config import (
     CASHFREE_RECHARGE_LINK, MIN_RECHARGE_AMOUNT, REFERRAL_BONUS,
-    REVEAL_DELAY_MINUTES, ADMIN_ID
+    REVEAL_DELAY_MINUTES, ADMIN_ID, IST_TIMEZONE
 )
 from db.db_access import (
     get_user, create_user, update_user_balance, add_user_to_pot,
     update_user_ticket, check_referred_user_ticket_status,
     mark_referred_user_ticket_bought, increment_referral_count, update_user_upi,
-    add_recharge_to_history
+    add_recharge_to_history, get_user_counts_by_referral_source
 )
-from utils.ticket import generate_unique_ticket_code
+from utils.ticket import generate_unique_ticket_code, generate_ticket_image
 from utils.pot import get_current_pot_status, get_current_pot
 from utils.helpers import escape_markdown_v2
-from utils.ticket_generator import generate_ticket_image
 
 
 class ChannelJoinStates(StatesGroup):
@@ -304,9 +304,12 @@ async def process_recharge_details(message: types.Message, state: FSMContext, db
         await add_recharge_to_history(db, user_id, amount=amount, status="PENDING_MANUAL", order_id=transaction_id, user_name=user_name)
 
         markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{user_id}_{transaction_id}"),
-             [InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{user_id}_{transaction_id}")],
+            [
+                InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{user_id}_{transaction_id}"),
+                InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{user_id}_{transaction_id}")
+            ]
         ])
+
 
         await message.bot.send_message(admin_id,
             f"**🚨 New Pending Payment!**\n"
@@ -445,7 +448,7 @@ async def buyticket_command(message: types.Message, db, admin_id, main_channel_i
         await message.reply(
             f"🎉 Success! You've got your lucky ticket for today! 🎉\n"
             f"Your ticket code: `{ticket_code}`\n"
-            f"Used: ₹{bonus_to_deduct:.2f} (Bonus) + ₹{real_to_deduct:.2f} (Real)\n"
+            f"Used: ₹{bonus_to_duct:.2f} (Bonus) + ₹{real_to_deduct:.2f} (Real)\n"
             f"New balances: Real: ₹{updated_user_after_deduction.get('real_balance', 0.0):.2f}, Bonus: ₹{updated_user_after_deduction.get('bonus_balance', 0.0):.2f}\n"
             f"Good luck! The draw happens automatically shortly after the pot closes. 🍀"
         )

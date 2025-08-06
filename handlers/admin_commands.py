@@ -201,7 +201,6 @@ async def process_approved_amount(message: types.Message, state: FSMContext, db,
 async def admin_command(message: types.Message, db, admin_id, bot: Bot, ist_timezone: pytz.BaseTzInfo):
     logger.info(f"Handler for /admin called by {message.from_user.id}")
     if db is None or admin_id is None:
-        logger.error("DB or Admin ID instance not available in admin_command!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         return
     total_real, total_bonus = await get_total_balance(db)
@@ -240,7 +239,6 @@ async def admin_command(message: types.Message, db, admin_id, bot: Bot, ist_time
 async def reveal_command(message: types.Message, db, admin_id, bot: Bot, main_channel_id: int, ist_timezone: pytz.BaseTzInfo):
     logger.info(f"Handler for /reveal called by {message.from_user.id}")
     if db is None or admin_id is None or main_channel_id is None or ist_timezone is None:
-        logger.error("DB, Admin ID, Main Channel ID, or IST_TIMEZONE instance not available in reveal_command!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         return
     current_pot = await get_current_pot(db, ist_timezone)
@@ -254,7 +252,6 @@ async def reveal_command(message: types.Message, db, admin_id, bot: Bot, main_ch
 async def closepot_command(message: types.Message, db, admin_id, bot: Bot, main_channel_id: int, ist_timezone: pytz.BaseTzInfo):
     logger.info(f"Handler for /closepot called by {message.from_user.id}")
     if db is None or admin_id is None or main_channel_id is None or ist_timezone is None:
-        logger.error("DB, Admin ID, Main Channel ID, or IST_TIMEZONE instance not available in closepot_command!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         return
     current_pot = await get_current_pot(db, ist_timezone)
@@ -269,7 +266,6 @@ async def closepot_command(message: types.Message, db, admin_id, bot: Bot, main_
 async def openpot_command(message: types.Message, db, admin_id, bot: Bot, ist_timezone: pytz.BaseTzInfo, main_channel_id: int):
     logger.info(f"Handler for /openpot called by {message.from_user.id}")
     if db is None or ist_timezone is None:
-        logger.error("DB or IST_TIMEZONE instance not available in openpot_command!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         return
     now_ist = datetime.now(ist_timezone)
@@ -332,7 +328,6 @@ async def process_setpot_callback(call: types.CallbackQuery, state: FSMContext, 
 async def process_set_pot_limit(message: types.Message, state: FSMContext, db, admin_id, bot: Bot):
     logger.info(f"Executing process_set_pot_limit logic for {message.from_user.id}")
     if db is None:
-        logger.error("DB instance not available in process_set_pot_limit!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         await state.clear()
         return
@@ -358,7 +353,6 @@ async def process_set_pot_limit(message: types.Message, state: FSMContext, db, a
 async def process_set_ticket_price(message: types.Message, state: FSMContext, db, admin_id, bot: Bot):
     logger.info(f"Executing process_set_ticket_price logic for {message.from_user.id}")
     if db is None:
-        logger.error("DB instance not available in process_set_ticket_price!")
         await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
         await state.clear()
         return

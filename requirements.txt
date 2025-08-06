@@ -1,6 +1,5 @@
 aiogram
 motor
-aiohttp
 pytz
 Pillow
-Flask
+aiohttp
