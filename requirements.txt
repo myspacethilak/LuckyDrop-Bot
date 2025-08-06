@@ -1,0 +1,6 @@
+aiogram
+motor
+aiohttp
+pytz
+Pillow
+Flask
