@@ -17,11 +17,13 @@ from aiogram.client.default import DefaultBotProperties
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 
-# Import all modules from their new locations
+# Import config settings
 from bot_config import (
     BOT_TOKEN, ADMIN_ID, MONGO_URI, MAIN_CHANNEL_ID, ADMIN_SECRET_CODE,
     IST_TIMEZONE, UTC_TIMEZONE
 )
+
+# Import other modules from new locations
 from db.db_access import init_db
 from handlers.user_commands import register_user_handlers, UserStates
 from handlers.admin_commands import register_admin_handlers, AdminStates
@@ -49,7 +51,6 @@ db = db_client.lotterydb
 pot_scheduler_task = None
 
 def log_unhandled_exceptions(exctype, value, tb):
-    """A global exception hook to log unhandled errors to a file."""
     with open('error.log', 'a') as f:
         f.write(f"[{datetime.now()}] Unhandled Exception:\n")
         traceback.print_exception(exctype, value, tb, file=f)
@@ -133,10 +134,24 @@ async def on_shutdown(dispatcher: Dispatcher, bot: Bot):
     logger.info("MongoDB connection closed.")
     logger.info("Bot shutdown complete.")
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', os.getenv('PORT', 8080))
+    await site.start()
+
+async def main():
+    server_task = asyncio.create_task(start_web_server())
+    polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    await asyncio.gather(server_task, polling_task)
+
+
 if __name__ == '__main__':
     sys.excepthook = log_unhandled_exceptions
 
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    asyncio.run(dp.start_polling(bot, skip_updates=True))
+    asyncio.run(main())

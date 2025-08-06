@@ -35,7 +35,7 @@ async def generate_unique_ticket_code(db):
         return code
 
 def generate_ticket_image(code: str, user_id: str, referral_name: str = None):
-    base_path = "assets/WhatsApp Image 2025-08-02 at 17.46.19_8d7ca5f8.png"
+    base_path = "assets/ticket_template.png"
     output_path = f"generated_tickets/{user_id}_{code}.png"
     os.makedirs("generated_tickets", exist_ok=True)
 
@@ -49,11 +49,11 @@ def generate_ticket_image(code: str, user_id: str, referral_name: str = None):
 
     try:
         font_code = ImageFont.truetype("assets/BebasNeue-Regular.ttf", 90)
-        font_uid = ImageFont.truetype("assets/BebasNeue-Regular.ttf", 25)
+        font_uid = ImageFont.truetype("assets/BebasNeue-Regular.ttf", 35)
     except Exception as e:
         logger.warning(f"Failed to load custom fonts: {e}. Using default.")
         font_code = ImageFont.load_default(size=90)
-        font_uid = ImageFont.load_default(size=25)
+        font_uid = ImageFont.load_default(size=35)
 
     w, h = base.size
 
@@ -71,8 +71,8 @@ def generate_ticket_image(code: str, user_id: str, referral_name: str = None):
 
     uid_box_left = w * 0.795
     uid_box_top = h * 0.77
-    uid_box_right = w * 0.94
-    uid_box_bottom = h * 0.85
+    uid_box_right = w * 0.98
+    uid_box_bottom = h * 0.95
 
     uid_box_width = uid_box_right - uid_box_left
     uid_box_height = uid_box_bottom - uid_box_top
@@ -80,7 +80,7 @@ def generate_ticket_image(code: str, user_id: str, referral_name: str = None):
     uid_x = uid_box_left + (uid_box_width - uid_w) / 2
     uid_y = uid_box_top + (uid_box_height - uid_h) / 2
 
-    draw.text((uid_x, uid_y), uid_text_value, font=font_uid, fill="black")
+    draw.text((uid_x, uid_y), uid_text_value, font=font_uid, fill="white")
 
     base.save(output_path)
     return output_path

@@ -7,9 +7,6 @@ import re
 from functools import wraps
 from io import BytesIO
 
-# NEW: The Pillow imports are now only in ticket.py, not here.
-# from PIL import Image, ImageDraw, ImageFont
-
 from aiogram import Router, types, F, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -310,7 +307,6 @@ async def process_recharge_details(message: types.Message, state: FSMContext, db
             ]
         ])
 
-
         await message.bot.send_message(admin_id,
             f"**🚨 New Pending Payment!**\n"
             f"From User: [{escape_markdown_v2(user_name)}](tg://user?id={user_id})\n"
@@ -448,7 +444,7 @@ async def buyticket_command(message: types.Message, db, admin_id, main_channel_i
         await message.reply(
             f"🎉 Success! You've got your lucky ticket for today! 🎉\n"
             f"Your ticket code: `{ticket_code}`\n"
-            f"Used: ₹{bonus_to_duct:.2f} (Bonus) + ₹{real_to_deduct:.2f} (Real)\n"
+            f"Used: ₹{bonus_to_deduct:.2f} (Bonus) + ₹{real_to_deduct:.2f} (Real)\n"
             f"New balances: Real: ₹{updated_user_after_deduction.get('real_balance', 0.0):.2f}, Bonus: ₹{updated_user_after_deduction.get('bonus_balance', 0.0):.2f}\n"
             f"Good luck! The draw happens automatically shortly after the pot closes. 🍀"
         )
