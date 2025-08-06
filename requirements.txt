@@ -3,3 +3,4 @@ motor
 aiohttp
 pytz
 Pillow
+httpx
