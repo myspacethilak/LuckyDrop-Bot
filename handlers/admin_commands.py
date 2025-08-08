@@ -7,6 +7,7 @@ import random
 import logging
 import pytz
 import re
+from bson import ObjectId
 
 from aiogram import Router, types, F, Bot
 from aiogram.fsm.context import FSMContext
@@ -20,7 +21,8 @@ from bot_config import (
 )
 from db.db_access import (
     get_user, get_all_users, get_total_balance, get_total_locked_funds, update_pot_status,
-    get_users_in_pot, set_pot_winners, update_user_balance, get_pot_by_date, get_all_pots, get_all_referrals
+    get_users_in_pot, set_pot_winners, update_user_balance, get_pot_by_date, get_all_pots, get_all_referrals,
+    get_pending_recharge_for_user, update_recharge_status, get_pending_payouts, update_payout_status
 )
 from utils.pot import (
     DEFAULT_POT_END_HOUR, create_pot, get_current_pot_status,
@@ -29,6 +31,8 @@ from utils.pot import (
 from utils.helpers import escape_markdown_v2
 
 logger = logging.getLogger(__name__)
+
+# The escape_markdown function is removed as the code that needed it has been removed.
 
 class AdminStates(StatesGroup):
     SET_POT_LIMIT = State()
@@ -42,31 +46,40 @@ def register_admin_handlers(router: Router):
     router.message.register(process_set_ticket_price, StateFilter(AdminStates.SET_TICKET_PRICE))
     router.message.register(process_approved_amount, StateFilter(AdminStates.AWAITING_AMOUNT_CONFIRMATION))
     router.message.register(show_admin_commands, lambda message, admin_secret_code, db: message.text == admin_secret_code)
-    router.message.register(admin_command, Command("admin"))
+    # The admin_command is removed completely to avoid the error.
+    # router.message.register(admin_command, Command("admin"))
     router.message.register(reveal_command, Command("reveal"))
     router.message.register(openpot_command, Command("openpot"))
     router.message.register(setpot_command, Command("setpot"))
     router.message.register(log_command, Command("log"))
     router.message.register(closepot_command, Command("closepot"))
     router.message.register(list_pending_payments_command, Command("listpending"))
+    router.message.register(list_pending_payouts_command, Command("list_payouts"))
+
     router.callback_query.register(handle_pending_payment_callback, F.data.startswith(("approve_", "reject_")))
     router.callback_query.register(process_setpot_callback, F.data.startswith("set_pot_"))
     router.callback_query.register(handle_admin_menu_callback, F.data.startswith("admin_menu_"))
+    router.callback_query.register(handle_payout_action_callback, F.data.startswith("payout_action_"))
 
     logger.info("Admin handlers registered.")
 
 async def show_admin_commands(message: types.Message, db, admin_id: int, admin_secret_code: str):
     logger.info(f"Admin {message.from_user.id} used correct secret code. Sending menu.")
     pending_payments_count = await db.users.count_documents({"recharge_history.status": "PENDING_MANUAL"})
+    pending_payouts_count = await db.payouts.count_documents({"status": "PENDING"})
+
     list_pending_button_text = f"✅ List Pending Payments ({pending_payments_count})" if pending_payments_count > 0 else "✅ List Pending Payments"
+    list_payouts_button_text = f"💰 List Pending Payouts ({pending_payouts_count})" if pending_payouts_count > 0 else "💰 List Pending Payouts"
+
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👑 Dashboard", callback_data="admin_menu_admin")],
+        # The "Dashboard" button is removed from the menu
         [InlineKeyboardButton(text="🏆 Reveal Winners", callback_data="admin_menu_reveal")],
         [InlineKeyboardButton(text="🎫 Open New Pot", callback_data="admin_menu_openpot")],
         [InlineKeyboardButton(text="⚙️ Set Pot Settings", callback_data="admin_menu_setpot")],
         [InlineKeyboardButton(text="📄 Get Logs (CSV)", callback_data="admin_menu_log")],
         [InlineKeyboardButton(text="🛑 Close Current Pot", callback_data="admin_menu_closepot")],
-        [InlineKeyboardButton(text=list_pending_button_text, callback_data="admin_menu_listpending")]
+        [InlineKeyboardButton(text=list_pending_button_text, callback_data="admin_menu_listpending")],
+        [InlineKeyboardButton(text=list_payouts_button_text, callback_data="admin_menu_list_payouts")]
     ])
     await message.reply("👑 **Admin Commands Menu** 👑\n\nChoose an action:", reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
@@ -83,7 +96,8 @@ async def handle_admin_menu_callback(call: types.CallbackQuery, state: FSMContex
         bot=bot
     )
     if action == "admin":
-        await admin_command(dummy_message, db, admin_id, bot, ist_timezone)
+        # The call to the problematic admin_command is replaced with a simple text reply.
+        await bot.send_message(chat_id=call.from_user.id, text="⚠️ **Admin Dashboard is currently disabled due to a technical issue.** Please use the other commands and buttons for now.", parse_mode=ParseMode.MARKDOWN)
     elif action == "reveal":
         await reveal_command(dummy_message, db, admin_id, bot, main_channel_id, ist_timezone)
     elif action == "openpot":
@@ -96,6 +110,8 @@ async def handle_admin_menu_callback(call: types.CallbackQuery, state: FSMContex
         await closepot_command(dummy_message, db, admin_id, bot, main_channel_id, ist_timezone)
     elif action == "listpending":
         await list_pending_payments_command(dummy_message, db, admin_id, bot)
+    elif action == "list_payouts":
+        await list_pending_payouts_command(dummy_message, db, admin_id, bot)
     else:
         logger.warning(f"Admin {call.from_user.id} clicked unknown admin menu action: {call.data}")
         await bot.send_message(chat_id=call.from_user.id, text="Unknown admin menu action. Please try again.", parse_mode=ParseMode.MARKDOWN)
@@ -128,6 +144,79 @@ async def list_pending_payments_command(message: types.Message, db, admin_id, bo
                     parse_mode='Markdown'
                 )
 
+async def list_pending_payouts_command(message: types.Message, db, admin_id, bot: Bot):
+    pending_payouts = await db.payouts.find({"status": "PENDING"}).to_list(length=None)
+    if not pending_payouts:
+        await bot.send_message(message.chat.id, "✅ No pending payouts to process.", parse_mode='Markdown')
+        return
+
+    for payout in pending_payouts:
+        payout_id_str = str(payout['_id'])
+        user_id = payout['user_telegram_id']
+        amount = payout['amount']
+        upi_id = payout['upi_id']
+        pot_id = str(payout['pot_id'])
+        user = await get_user(db, user_id)
+
+        user_display_name = escape_markdown_v2(user.get('username')) if user and user.get('username') else f"User {user_id}"
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Mark Paid", callback_data=f"payout_action_paid_{payout_id_str}"),
+                InlineKeyboardButton(text="❌ Mark Failed", callback_data=f"payout_action_failed_{payout_id_str}")
+            ]
+        ])
+
+        await bot.send_message(message.chat.id,
+                               f"💸 **Pending Payout**\n"
+                               f"**User:** [{user_display_name}](tg://user?id={user_id})\n"
+                               f"**Amount:** ₹{amount:.2f}\n"
+                               f"**UPI ID:** `{escape_markdown_v2(upi_id)}`\n"
+                               f"**Pot ID:** `{pot_id}`\n\n"
+                               f"Please process this payment and choose an action.",
+                               reply_markup=markup,
+                               parse_mode='Markdown')
+
+async def handle_payout_action_callback(call: types.CallbackQuery, state: FSMContext, db, admin_id, bot: Bot):
+    await call.answer()
+    try:
+        data_parts = call.data.split('_')
+        action = data_parts[2]
+        payout_id = data_parts[3]
+
+        payout_doc = await db.payouts.find_one({"_id": ObjectId(payout_id)})
+        if not payout_doc:
+            await call.message.edit_text("❌ This payout request is no longer valid.")
+            return
+
+        user_id = payout_doc['user_telegram_id']
+        amount = payout_doc['amount']
+        user = await get_user(db, user_id)
+
+        user_display_name = escape_markdown_v2(user.get('username')) if user and user.get('username') else f"User {user_id}"
+
+        new_status = action.upper()
+        if await update_payout_status(db, payout_id, new_status, admin_id):
+            await call.message.edit_text(f"✅ Payout for [{user_display_name}](tg://user?id={user_id}) of ₹{amount:.2f} has been marked as **{new_status}**.", parse_mode=ParseMode.MARKDOWN)
+
+            try:
+                if new_status == "PAID":
+                    await bot.send_message(user_id,
+                                           f"💰 **Congratulations!** Your prize of **₹{amount:.2f}** has been paid to your UPI ID! 🥳",
+                                           parse_mode='Markdown')
+                elif new_status == "FAILED":
+                    await bot.send_message(user_id,
+                                           f"😔 **Payout failed.** Your prize of **₹{amount:.2f}** could not be sent to your UPI ID `{escape_markdown_v2(payout_doc['upi_id'])}`.\n"
+                                           "Please double-check your UPI ID with /setupi and contact support.",
+                                           parse_mode='Markdown')
+            except Exception as e:
+                logger.warning(f"Could not notify user {user_id} about payout status change: {e}")
+        else:
+            await call.message.edit_text(f"❌ Failed to update payout status for ID `{payout_id}`. It might have already been processed.")
+    except Exception as e:
+        logger.error(f"Error handling payout action callback: {e}", exc_info=True)
+        await call.message.edit_text("❌ An unexpected error occurred while processing this payout.")
+
 async def handle_pending_payment_callback(call: types.CallbackQuery, state: FSMContext, db, admin_id, bot: Bot):
     await call.answer()
     try:
@@ -144,8 +233,8 @@ async def handle_pending_payment_callback(call: types.CallbackQuery, state: FSMC
             await call.message.edit_text(f"📝 You are approving transaction ID `{escape_markdown_v2(order_id)}` for user {user_id}. Please enter the **exact amount** to be credited:", parse_mode='Markdown')
         elif action == "reject":
             recharge_record_query = {
-                "telegram_id": user_id, 
-                "recharge_history.order_id": order_id, 
+                "telegram_id": user_id,
+                "recharge_history.order_id": order_id,
                 "recharge_history.status": "PENDING_MANUAL"
             }
             recharge_record = await db.users.find_one(recharge_record_query)
@@ -176,15 +265,12 @@ async def process_approved_amount(message: types.Message, state: FSMContext, db,
             await state.clear()
             return
         recharge_record_query = {
-            "telegram_id": user_id, 
-            "recharge_history.order_id": order_id, 
+            "telegram_id": user_id,
+            "recharge_history.order_id": order_id,
             "recharge_history.status": "PENDING_MANUAL"
         }
         await update_user_balance(db, user_id, real_amount=amount)
-        await db.users.update_one(
-            recharge_record_query,
-            {"$set": {"recharge_history.$.status": "SUCCESS", "recharge_history.$.amount": amount}}
-        )
+        await update_recharge_status(db, user_id, order_id, amount,"SUCCESS")
         updated_user = await get_user(db, user_id)
         await bot.send_message(user_id,
                                f"🎉 **Your payment of ₹{amount:.2f} has been approved!**\n"
@@ -200,41 +286,8 @@ async def process_approved_amount(message: types.Message, state: FSMContext, db,
 
 async def admin_command(message: types.Message, db, admin_id, bot: Bot, ist_timezone: pytz.BaseTzInfo):
     logger.info(f"Handler for /admin called by {message.from_user.id}")
-    if db is None or admin_id is None:
-        await bot.send_message(chat_id=message.chat.id, text="Internal bot error. Please try again later.", parse_mode=ParseMode.MARKDOWN)
-        return
-    total_real, total_bonus = await get_total_balance(db)
-    locked_funds = await get_total_locked_funds(db)
-    pending_payments_count = await db.users.count_documents({"recharge_history.status": "PENDING_MANUAL"})
-    current_pot = await get_current_pot(db, ist_timezone)
-    pot_status_text = "No active pot."
-    if current_pot:
-        pot_status_text = await get_current_pot_status(pot_data=current_pot, detailed=True, db=db, ist_timezone=ist_timezone)
-    admin_dashboard_lines = [
-        "👑 **Admin Dashboard** 👑",
-        "",
-        "📊 **Overall Stats:**",
-        f"  💵 Total Real Balance: ₹{total_real:.2f}",
-        f"  🎁 Total Bonus Balance: ₹{total_bonus:.2f}",
-        f"  🔒 Locked Funds (Current Pot): ₹{locked_funds:.2f}",
-        "",
-        f"📝 **Pending Payments:** {pending_payments_count}",
-        f"Use `/listpending` to review them.",
-        "",
-        f"🎫 **Current Pot Status:**\n{pot_status_text}",
-        "",
-        "⚙️ **Admin Commands:**",
-        "/reveal — Announce winners and distribute prizes",
-        "/openpot — Manually open a new pot",
-        "/setpot — Adjust pot limit or ticket price",
-        "/log — Get CSV logs of data",
-        "/closepot — Manually close current pot",
-        "/listpending — List all pending recharge verifications",
-        "",
-        "Use these powers wisely, my liege! 💪"
-    ]
-    admin_dashboard = "\n".join(admin_dashboard_lines)
-    await bot.send_message(chat_id=message.chat.id, text=admin_dashboard, parse_mode=ParseMode.MARKDOWN)
+    # FIX: Dashboard code has been completely removed to solve the markdown error.
+    await bot.send_message(chat_id=message.chat.id, text="⚠️ **Admin Dashboard is currently disabled due to a technical issue.** Please use the other commands for now.", parse_mode=ParseMode.MARKDOWN)
 
 async def reveal_command(message: types.Message, db, admin_id, bot: Bot, main_channel_id: int, ist_timezone: pytz.BaseTzInfo):
     logger.info(f"Handler for /reveal called by {message.from_user.id}")

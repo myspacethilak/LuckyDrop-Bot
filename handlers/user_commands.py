@@ -24,12 +24,12 @@ from db.db_access import (
     get_user, create_user, update_user_balance, add_user_to_pot,
     update_user_ticket, check_referred_user_ticket_status,
     mark_referred_user_ticket_bought, increment_referral_count, update_user_upi,
-    add_recharge_to_history, get_user_counts_by_referral_source
+    add_recharge_to_history, get_user_counts_by_referral_source, get_pending_payout_for_user,
+    get_available_tickets, purchase_ticket_atomically, get_pending_recharge_for_user
 )
 from utils.ticket import generate_unique_ticket_code, generate_ticket_image
 from utils.pot import get_current_pot_status, get_current_pot
 from utils.helpers import escape_markdown_v2
-
 
 class ChannelJoinStates(StatesGroup):
     WAITING_FOR_CHANNEL_JOIN = State()
@@ -38,6 +38,9 @@ class UserStates(StatesGroup):
     WAITING_FOR_UPI_ID = State()
     CONFIRM_UPI_ID = State()
     WAITING_FOR_RECHARGE_DETAILS = State()
+    CHOOSING_TICKET = State()
+    CHOOSING_BONUS = State()
+
 
 def register_user_handlers(router: Router):
     logger.info("Registering user handlers...")
@@ -49,6 +52,7 @@ def register_user_handlers(router: Router):
     router.message.register(pot_command, Command("pot"))
     router.message.register(help_command, Command("help"))
     router.message.register(setupi_command, Command("setupi"))
+    router.message.register(recharge_status_command, Command("recharge_status"))
 
     router.message.register(process_upi_input, UserStates.WAITING_FOR_UPI_ID)
     router.callback_query.register(confirm_upi_callback, F.data.startswith("confirm_upi_"), UserStates.CONFIRM_UPI_ID)
@@ -57,6 +61,13 @@ def register_user_handlers(router: Router):
     router.message.register(process_recharge_details, UserStates.WAITING_FOR_RECHARGE_DETAILS)
 
     router.callback_query.register(check_channel_membership, F.data == "check_channel_membership", ChannelJoinStates.WAITING_FOR_CHANNEL_JOIN)
+
+    router.callback_query.register(process_bonus_selection_and_buy, UserStates.CHOOSING_BONUS, F.data.startswith("select_bonus_"))
+    router.callback_query.register(process_ticket_selection, UserStates.CHOOSING_TICKET, F.data.startswith("buy_ticket_"))
+    router.callback_query.register(handle_sold_ticket_click, F.data.startswith("ticket_sold_"))
+    router.callback_query.register(handle_sold_ticket_click, UserStates.CHOOSING_TICKET, F.data.startswith("ticket_sold_"))
+
+
     logger.info("User handlers registered.")
 
 async def is_user_member_of_channel(bot: Bot, user_id: int, channel_id: int) -> bool:
@@ -164,14 +175,15 @@ async def start_command(message: types.Message, state: FSMContext, db, admin_id,
 
     user = await get_user(db, user_id)
 
+    # FIX: Updated message to reflect 'one ticket per pot'
     welcome_message = (
         "👋 Welcome to **LuckyDrop Bot**, where daily drops can make your day! 🤑\n\n"
         "Here's how to play:\n"
         "✨ We have one daily pot from **5:00 PM to 7:00 PM IST**.\n"
-        "🎟️ Buy a ticket for ₹50. Max one ticket per user per day!\n"
+        "🎟️ Buy a ticket for ₹50. **Max one ticket per user per pot!**\n"
         "🍀 Each ticket has a **unique 6-digit code**.\n"
         "💰 Tickets are bought using up to ₹30 bonus + ₹20 real balance.\n"
-        "🏅 After **7:00 PM IST**, winners are chosen randomly by our fair system and the full prize pool is awarded if we hit 30 users:\n"
+        "🏅 After **7:00 PM IST**, winners are chosen randomly from all **sold tickets** and the full prize pool is awarded if we hit 30 users:\n"
         "   🥇 1st: ₹500\n"
         "   🥈 2nd: ₹200\n"
         "   🥉 3rd: ₹100\n"
@@ -261,9 +273,16 @@ async def wallet_command(message: types.Message, db, admin_id, main_channel_id, 
         await message.reply("Looks like you're new here! Please use /start to register. 🤖")
         return
 
+    pending_recharge = await get_pending_recharge_for_user(db, message.from_user.id)
+
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="I have paid! ✅", callback_data="recharge_paid")]
     ])
+
+    if pending_recharge:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Check Recharge Status ⏳", callback_data="recharge_status_check")]
+        ])
 
     await message.reply(
         f"💰 Your Wallet:\n"
@@ -275,6 +294,23 @@ async def wallet_command(message: types.Message, db, admin_id, main_channel_id, 
         reply_markup=markup,
         disable_web_page_preview=True
     )
+
+@check_channel_membership_decorator
+async def recharge_status_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /recharge_status called by {message.from_user.id}")
+    pending_recharge = await get_pending_recharge_for_user(db, message.from_user.id)
+
+    if pending_recharge:
+        await message.reply(
+            f"⏳ **Your pending recharge request:**\n"
+            f"Amount: ₹{pending_recharge.get('amount'):.2f}\n"
+            f"Transaction ID: `{pending_recharge.get('order_id')}`\n"
+            f"Status: **Pending Admin Approval**\n\n"
+            f"An admin will verify it shortly. You'll be notified once it's confirmed!"
+        )
+    else:
+        await message.reply("✅ You have no pending recharge requests. Use /wallet to recharge your balance.")
+
 
 async def prompt_for_recharge_details(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
@@ -325,7 +361,8 @@ async def process_recharge_details(message: types.Message, state: FSMContext, db
         await message.reply("An unexpected error occurred. Please try again.")
         await state.clear()
 
-async def buyticket_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+@check_channel_membership_decorator
+async def buyticket_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone, state: FSMContext):
     logger.info(f"Handler for /buyticket called by {message.from_user.id}")
     user = await get_user(db, message.from_user.id)
     if not user:
@@ -337,126 +374,508 @@ async def buyticket_command(message: types.Message, db, admin_id, main_channel_i
         await message.reply("🎟️ The pot is currently closed! Ticket sales are open daily from **5:00 PM to 7:00 PM IST.** Stay tuned! ⏳")
         return
 
-    today_date = datetime.now(ist_timezone).date()
-    user_last_ticket_date_ist = None
-    if user.get('last_ticket_date'):
-        if user['last_ticket_date'].tzinfo is None:
-            user_last_ticket_date_ist = pytz.utc.localize(user['last_ticket_date']).astimezone(ist_timezone).date()
-        else:
-            user_last_ticket_date_ist = user['last_ticket_date'].astimezone(ist_timezone).date()
-
-    if user_last_ticket_date_ist == today_date and \
-       any(p.get('telegram_id') == user['telegram_id'] for p in current_pot.get('participants', [])):
-        await message.reply(f"🚫 You've already bought your ticket for today's pot! Your ticket code is: `{user['last_ticket_code']}`. Good luck! 🤞")
+    # FIX: Check if user has a ticket in the *current pot*
+    user_tickets_in_current_pot = [p['ticket_code'] for p in current_pot.get('participants', []) if p['telegram_id'] == user['telegram_id']]
+    if user_tickets_in_current_pot:
+        await message.reply(f"🚫 You've already bought your ticket for this pot! Your ticket code is: `{user_tickets_in_current_pot[0]}`. Good luck! 🤞")
         return
 
+    all_tickets = await db.tickets.find({"pot_id": current_pot['_id']}).to_list(length=None)
+    sold_ticket_codes = {p['ticket_code'] for p in current_pot.get('participants', [])}
+
+    sold_count = len(sold_ticket_codes)
+    max_users = current_pot.get('max_users', 30)
+
+    keyboard = []
+    row = []
+
+    for ticket in all_tickets:
+        if ticket['code'] in sold_ticket_codes:
+            row.append(InlineKeyboardButton(text=f"🔒 {ticket['code']}", callback_data=f"ticket_sold_{ticket['code']}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"🍀 {ticket['code']}", callback_data=f"buy_ticket_{ticket['code']}"))
+
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    message_text = (
+        "🐺🔥 **The pot is LIVE!** 🔥🐺\n"
+        f"**Tickets Sold: {sold_count}/{max_users}**\n\n"
+        "Your destiny is just a click away. Select your lucky number and secure your spot in today's prize draw.\n\n"
+        "**Legend:**\n"
+        "🍀 - Available Tickets (Your opportunity)\n"
+        "🔒 - Sold Tickets (Missed chance)\n\n"
+        "This is not a game of chance, it's a game of speed. The pot is filling fast! Don't get left behind! 🚀"
+    )
+
+    await message.reply(
+        message_text,
+        reply_markup=reply_markup
+    )
+
+    await state.set_state(UserStates.CHOOSING_TICKET)
+
+
+async def process_ticket_selection(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer()
+
+    ticket_code = call.data.split('_')[2]
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
     ticket_price = current_pot.get('ticket_price', 50.0)
-    bonus_to_use = min(user.get('bonus_balance', 0.0), 30.0)
+
+    if user.get('real_balance', 0.0) + user.get('bonus_balance', 0.0) < ticket_price:
+        await call.message.edit_text(
+            f"💸 Oh no! Your total balance (`Real: ₹{user.get('real_balance', 0.0):.2f}, Bonus: ₹{user.get('bonus_balance', 0.0):.2f}`) "
+            f"is not enough to buy ticket `{ticket_code}` for `₹{ticket_price:.2f}`.\n\n"
+            f"Please recharge your wallet with /wallet first, then try again."
+        )
+        await state.clear()
+        return
+
+    await state.update_data(chosen_ticket=ticket_code)
+
+    bonus_balance = user.get('bonus_balance', 0.0)
+    keyboard = []
+
+    if bonus_balance >= 30:
+        keyboard.append([InlineKeyboardButton(text="Use ₹30 from Bonus", callback_data=f"select_bonus_30")])
+    if bonus_balance >= 20:
+        keyboard.append([InlineKeyboardButton(text="Use ₹20 from Bonus", callback_data=f"select_bonus_20")])
+    if bonus_balance >= 10:
+        keyboard.append([InlineKeyboardButton(text="Use ₹10 from Bonus", callback_data=f"select_bonus_10")])
+
+    if user.get('real_balance', 0.0) >= ticket_price:
+        keyboard.append([InlineKeyboardButton(text="Use only Real Cash", callback_data=f"select_bonus_0")])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    await call.message.edit_text(
+        "💰 **How would you like to pay for ticket `{}`?**\n\n"
+        "Your balance: `Real: ₹{:.2f}, Bonus: ₹{:.2f}`\n"
+        "Ticket Price: `₹{:.2f}`\n\n"
+        "Please select a payment method below.".format(
+            ticket_code, user.get('real_balance', 0.0), user.get('bonus_balance', 0.0), ticket_price
+        ),
+        reply_markup=reply_markup
+    )
+
+    await state.set_state(UserStates.CHOOSING_BONUS)
+
+
+async def process_bonus_selection_and_buy(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer("Finalizing your purchase...")
+
+    state_data = await state.get_data()
+    ticket_code = state_data.get('chosen_ticket')
+
+    if not ticket_code:
+        await call.message.edit_text("❌ An error occurred. Please try the /buyticket command again.")
+        await state.clear()
+        return
+
+    selected_bonus_amount = int(call.data.split('_')[2])
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
+    ticket_price = current_pot.get('ticket_price', 50.0)
+
+    bonus_to_use = min(selected_bonus_amount, user.get('bonus_balance', 0.0))
     real_needed = ticket_price - bonus_to_use
 
     if user.get('real_balance', 0.0) < real_needed:
-        remaining_needed = real_needed - user.get('real_balance', 0.0)
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Recharge Now 💳", url=CASHFREE_RECHARGE_LINK)],
-            [InlineKeyboardButton(text="I have paid! ✅", callback_data="recharge_paid")]
-        ])
-        await message.reply(
-            f"💸 Oh no! You need **₹{real_needed:.2f}** from your real balance to buy this ticket "
-            f"(after using ₹{bonus_to_use:.2f} from bonus). "
-            f"You only have ₹{user.get('real_balance', 0.0):.2f} real balance. "
-            f"Please recharge at least ₹{max(MIN_RECHARGE_AMOUNT, remaining_needed):.2f}).",
-            reply_markup=markup
-        )
+        await call.message.edit_text(f"💸 You don't have enough real balance to cover this. You need ₹{real_needed:.2f} more. Please recharge your wallet with /wallet.")
+        await state.clear()
         return
 
-    user_before_deduction = await get_user(db, message.from_user.id)
-    if not user_before_deduction:
-        await message.reply("Error: Could not verify your balance. Please try again.")
-        logger.error(f"User {message.from_user.id} not found right before ticket deduction.")
+    purchase_success = await purchase_ticket_atomically(db, current_pot['_id'], user_id, ticket_code)
+
+    if not purchase_success:
+        await call.message.edit_text(f"Oh no! Ticket `{ticket_code}` was just sold. Please choose another ticket from the list below.")
+        await state.clear()
+        await buyticket_command(call.message, db, admin_id, main_channel_id, ist_timezone, state)
         return
 
-    bonus_to_deduct = min(user_before_deduction.get('bonus_balance', 0.0), 30.0)
-    real_to_deduct = ticket_price - bonus_to_use
-
-    if user_before_deduction.get('real_balance', 0.0) < real_to_deduct:
-        await message.reply("Error: Insufficient real balance after re-check. Please try again.")
-        logger.error(f"User {message.from_user.id} insufficient real balance on re-check.")
-        return
-
-    await update_user_balance(db, message.from_user.id, real_amount=-real_to_deduct, bonus_amount=-bonus_to_deduct)
-
-    updated_user_after_deduction = await get_user(db, message.from_user.id)
-
-    ticket_code = await generate_unique_ticket_code(db)
-
-    await add_user_to_pot(db, current_pot['_id'], message.from_user.id, ticket_code)
-    await update_user_ticket(db, message.from_user.id, ticket_code)
-
-    if user.get('referred_by'):
-        referrer_id = user['referred_by']
-        already_credited = await check_referred_user_ticket_status(db, referrer_id, user['telegram_id'])
-        if not already_credited:
-            referrer_user = await get_user(db, referrer_id)
-            if referrer_user:
-                await update_user_balance(db, referrer_id, bonus_amount=REFERRAL_BONUS)
-                await increment_referral_count(db, referrer_id)
-                await mark_referred_user_ticket_bought(db, referrer_id, user['telegram_id'])
-                try:
-                    referred_username_display = escape_markdown_v2(user.get('username')) if user.get('username') else str(user['telegram_id'])
-                    await message.bot.send_message(referrer_id,
-                        f"🎉 **Referral Bonus!** Your referred friend "
-                        f"[{referred_username_display}](tg://user?id={user['telegram_id']}) "
-                        f"just bought their first ticket! You've received a ₹{REFERRAL_BONUS:.2f} bonus! 🥳"
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not send referral bonus message to {referrer_id}: {e}")
-
-    pot_end_time_utc = current_pot.get('end_time')
-    if pot_end_time_utc and ist_timezone:
-        pot_end_time_ist = pot_end_time_utc.astimezone(ist_timezone)
-        announcement_time_ist = pot_end_time_ist + timedelta(minutes=REVEAL_DELAY_MINUTES)
-        end_time_display = pot_end_time_ist.strftime('%I:%M %p IST')
-        announcement_time_display = announcement_time_ist.strftime('%I:%M %p IST')
-    else:
-        end_time_display = 'pot closing time'
-        announcement_time_display = 'soon after'
+    await update_user_balance(db, user_id, real_amount=-real_needed, bonus_amount=-bonus_to_use)
+    await update_user_ticket(db, user_id, ticket_code)
 
     try:
         user_id_str = str(user.get('telegram_id'))
-
         image_path = generate_ticket_image(code=ticket_code, user_id=user_id_str, referral_name=None)
 
         if image_path and os.path.exists(image_path):
-            await message.answer_photo(photo=FSInputFile(image_path))
-
-            await message.reply(
-                f"🥳 **Your LuckyDrop ticket has been secured!**\n\n"
-                f"Your ticket code `{ticket_code}` is now in the draw for today's pot.\n"
-                f"The pot closes at **{end_time_display}**, with winners announced at **{announcement_time_display}**.\n\n"
-                f"Good luck! ✨ May fortune smile upon you in today's draw."
-            )
+            await call.message.answer_photo(photo=FSInputFile(image_path))
             os.remove(image_path)
-        else:
-            await message.reply(f"Ticket booked! But failed to generate image. Your code is: `{ticket_code}`")
 
+        await call.message.answer(
+            f"🎉 **CONGRATULATIONS!** 🎉\n"
+            f"Your lucky ticket `{ticket_code}` is now in the draw!\n"
+            f"You've taken the first step towards a win. Good luck! 🍀"
+        )
     except Exception as e:
-        logger.error(f"Error during image generation for user {message.from_user.id}: {e}", exc_info=True)
-        await message.reply(
+        logger.error(f"Error during image generation for user {user_id}: {e}", exc_info=True)
+        await call.message.edit_text(
             f"🎉 Success! You've got your lucky ticket for today! 🎉\n"
             f"Your ticket code: `{ticket_code}`\n"
-            f"Used: ₹{bonus_to_deduct:.2f} (Bonus) + ₹{real_to_deduct:.2f} (Real)\n"
-            f"New balances: Real: ₹{updated_user_after_deduction.get('real_balance', 0.0):.2f}, Bonus: ₹{updated_user_after_deduction.get('bonus_balance', 0.0):.2f}\n"
+            f"Used: ₹{bonus_to_use:.2f} (Bonus) + ₹{real_needed:.2f} (Real)\n"
             f"Good luck! The draw happens automatically shortly after the pot closes. 🍀"
         )
 
+
+    filled_count = len(current_pot.get('participants', [])) + 1
+    max_users = current_pot.get('max_users', 30)
+    if filled_count == max_users:
+        await call.bot.send_message(admin_id, f"🔔 **ATTENTION ADMIN!** The pot is now FULL! ({filled_count}/{max_users} users).")
+
+    await state.clear()
+
+
+async def handle_sold_ticket_click(call: types.CallbackQuery):
+    await call.answer("This ticket is already sold. Please select an available one.", show_alert=True)
+
+
+@check_channel_membership_decorator
+async def refer_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /refer called by {message.from_user.id}")
+    user = await get_user(db, message.from_user.id)
+    if not user:
+        await message.reply("Please use /start to register first. 🤖")
+        return
+
+    referral_code = user.get('referral_code', f"LUCKY{user['telegram_id']}")
+
+    bot_info = await message.bot.get_me()
+    referral_link = f"https://t.me/{bot_info.username}?start={referral_code}"
+
+    referral_count = user.get('referral_count', 0)
+
+    escaped_referral_code_display = escape_markdown_v2(referral_code)
+    clickable_referral_link_text = escape_markdown_v2("Click here to invite!")
+    clickable_referral_link = f"[{clickable_referral_link_text}]({referral_link})"
+
+    final_message_text = (
+        f"🤝 Share the luck! Refer your friends and earn a **₹{REFERRAL_BONUS:.2f} bonus** for each friend "
+        f"who joins and buys their first ticket!\n\n"
+        f"Your unique referral code: `{escaped_referral_code_display}`\n"
+        f"Your referral link: {clickable_referral_link}\n\n"
+        f"You have successfully referred **{referral_count}** friends! 🚀"
+    )
+
+    await message.reply(
+        final_message_text,
+        disable_web_page_preview=False
+    )
+
+@check_channel_membership_decorator
+async def pot_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /pot called by {message.from_user.id}")
     current_pot = await get_current_pot(db, ist_timezone)
-    if current_pot:
-        filled_count = len(current_pot['participants'])
-        max_users = current_pot['max_users']
-        if filled_count == max_users:
-            await message.bot.send_message(admin_id, f"🔔 **ATTENTION ADMIN!** The pot is now FULL! ({filled_count}/{max_users} users).")
-        elif filled_count >= max_users * 0.9 and filled_count < max_users:
-            await message.bot.send_message(admin_id, f"📢 **Heads Up Admin!** The pot is almost full! ({filled_count}/{max_users} users).")
+
+    if not current_pot:
+        await message.reply("⏳ There's no active pot right now. Ticket sales open daily from **5:00 PM to 7:00 PM IST!** Get ready! 🔔")
+        return
+
+    pot_status_message = await get_current_pot_status(pot_data=current_pot, db=db, ist_timezone=ist_timezone)
+    await message.reply(pot_status_message)
+
+@check_channel_membership_decorator
+async def help_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /help called by {message.from_user.id}")
+    # FIX: Updated message to reflect 'one ticket per pot'
+    help_text = (
+        "🤔 **How to Play LuckyDrop Bot:**\n\n"
+        "1.  **Daily Pot:** A new lottery pot opens every day from **5:00 PM to 7:00 PM IST**. 🕰️\n"
+        "2.  **Buy a Ticket:** Use `/buyticket` to purchase your lucky entry. Each ticket costs **₹50**. "
+        "You can use up to **₹30 from your bonus balance** and the rest from your real balance. **Only one ticket per user per pot!**\n"
+        "3.  **Unique Code:** Every ticket has a **unique 6-digit code**.\n"
+        "4.  **Wallet:** Check your `real_balance` and `bonus_balance` with `/wallet`. Recharge your real balance manually by paying via the Cashfree link and submitting your payment details for admin approval.\n"
+        "5.  **Refer & Earn:** Share your unique referral link (get it with `/refer`). When a friend joins via your link, "
+        "starts the bot, and buys their first ticket, you get a **₹10 bonus!** 🤝\n"
+        "6.  **Pot Status:** See how many tickets are sold with `/pot`.\n"
+        "7.  **UPI Payouts:** Winners get paid directly to their UPI ID. Use `/setupi` to register or update your UPI ID. **Payouts are processed within 12 hours of results!**\n\n"
+        "🏆 **Winning Rules (Draw after 7:00 PM IST):**\n"
+        "-   **Less than 10 users:** Everyone gets a full refund to their **real** wallet. No hard feelings! ↩️\n"
+        "-   **10 to 29 users:** Prizes scale proportionally. The more participants, the bigger the scaled prize! 📈\n"
+        "-   **30 users (Full Pot):**\n"
+        "   🥇 1st Prize: ₹500\n"
+        "   🥈 2nd: ₹200\n"
+        "   🥉 3rd: ₹100\n\n"
+        "Winners are chosen **fairly and randomly from all SOLD tickets** by the system and announced automatically shortly after the pot closes. Keep an eye out! 👀\n\n"
+        "Got it? Let's get lucky! ✨"
+    )
+    await message.reply(help_text)
+
+@check_channel_membership_decorator
+async def setupi_command(message: types.Message, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /setupi called by {message.from_user.id}")
+    user = await get_user(db, message.from_user.id)
+    if not user:
+        await message.reply("Please use /start to register first. 🤖")
+        return
+
+    current_upi = user.get('upi_id')
+    if current_upi:
+        await message.reply(f"Your current UPI ID is: `{escape_markdown_v2(current_upi)}`\n"
+                            "Do you want to update it? Please send your new UPI ID now.", parse_mode='Markdown')
+    else:
+        await message.reply("Please send your UPI ID (e.g., `yourname@bank` or `phonenumber@upi`).\n"
+                            "This is where your winnings will be sent! 💰", parse_mode='Markdown')
+
+    await state.set_state(UserStates.WAITING_FOR_UPI_ID)
+
+async def process_upi_input(message: types.Message, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    user_id = message.from_user.id
+    upi_id_raw = message.text.strip()
+
+    if not re.match(r"^[\w.\-]{2,}@[a-zA-Z]{2,}$", upi_id_raw):
+        await message.reply("That doesn't look like a valid UPI ID format. Please try again.\n"
+                            "Example: `yourname@bank` or `phonenumber@upi`\n"
+                            "Make sure it contains an `@` symbol and a dot (`.`) in the domain part.", parse_mode='Markdown')
+        return
+
+    await state.update_data(new_upi_id=upi_id_raw)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, confirm", callback_data=f"confirm_upi_yes")],
+        [InlineKeyboardButton(text="❌ No, re-enter", callback_data=f"confirm_upi_no")]
+    ])
+
+    await message.reply(f"You entered: `{escape_markdown_v2(upi_id_raw)}`\n"
+                        "Is this correct? Once confirmed, this will be used for your payouts.", reply_markup=markup, parse_mode='Markdown')
+    await state.set_state(UserStates.CONFIRM_UPI_ID)
+
+async def confirm_upi_callback(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer()
+    user_id = call.from_user.id
+    user_data = await state.get_data()
+    new_upi_id = user_data.get('new_upi_id')
+
+    if call.data == "confirm_upi_yes" and new_upi_id:
+        current_user = await get_user(db, user_id)
+        current_upi = current_user.get('upi_id')
+
+        await update_user_upi(db, user_id, new_upi_id)
+
+        pending_payout = await get_pending_payout_for_user(db, user_id, window_hours=10)
+
+        if pending_payout:
+            username = current_user.get('username')
+            if username:
+                user_name_display = escape_markdown_v2(username)
+            else:
+                user_name_display = f"User {user_id}"
+
+            try:
+                admin_message = (
+                    f"🔔 **URGENT: WINNER'S UPI ID UPDATED!** 🔔\n\n"
+                    f"**User:** [{user_name_display}](tg://user?id={user_id})\n"
+                    f"**New UPI ID:** `{escape_markdown_v2(new_upi_id)}`\n"
+                    f"**Prize Amount:** ₹{pending_payout['amount']:.2f}\n"
+                    f"Please process this payout manually. The user's UPI ID has been set/updated within the 10-hour window."
+                )
+                await call.bot.send_message(admin_id, admin_message, parse_mode='Markdown')
+            except Exception as e:
+                logger.error(f"Failed to notify admin about UPI update for winner {user_id}: {e}")
+
+        await call.message.edit_text(f"🎉 Your UPI ID has been set to: `{escape_markdown_v2(new_upi_id)}`\n"
+                                     "You're all set for payouts! 💰", parse_mode='Markdown')
+        logger.info(f"User {user_id} confirmed and set UPI ID: {new_upi_id}")
+    else:
+        await call.message.edit_text("UPI ID not confirmed. Please send your UPI ID again if you wish to set it.")
+        await state.set_state(UserStates.WAITING_FOR_UPI_ID)
+
+    await state.clear()
+
+
+@check_channel_membership_decorator
+async def buyticket_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone, state: FSMContext):
+    logger.info(f"Handler for /buyticket called by {message.from_user.id}")
+    user = await get_user(db, message.from_user.id)
+    if not user:
+        await message.reply("Please use /start to register before buying a ticket. 🚀")
+        return
+
+    current_pot = await get_current_pot(db, ist_timezone)
+    if not current_pot or current_pot.get('status') != 'open':
+        await message.reply("🎟️ The pot is currently closed! Ticket sales are open daily from **5:00 PM to 7:00 PM IST.** Stay tuned! ⏳")
+        return
+
+    # FIX: Check if user has a ticket in the *current pot*
+    user_tickets_in_current_pot = [p['telegram_id'] for p in current_pot.get('participants', [])]
+    if user['telegram_id'] in user_tickets_in_current_pot:
+        await message.reply(f"🚫 You've already bought your ticket for this pot! Your ticket code is: `{user['last_ticket_code']}`. Good luck! 🤞")
+        return
+
+    all_tickets = await db.tickets.find({"pot_id": current_pot['_id']}).to_list(length=None)
+    sold_ticket_codes = {p['ticket_code'] for p in current_pot.get('participants', [])}
+
+    sold_count = len(sold_ticket_codes)
+    max_users = current_pot.get('max_users', 30)
+
+    keyboard = []
+    row = []
+
+    for ticket in all_tickets:
+        if ticket['code'] in sold_ticket_codes:
+            row.append(InlineKeyboardButton(text=f"🔒 {ticket['code']}", callback_data=f"ticket_sold_{ticket['code']}"))
+        else:
+            row.append(InlineKeyboardButton(text=f"🍀 {ticket['code']}", callback_data=f"buy_ticket_{ticket['code']}"))
+
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    message_text = (
+        "🐺🔥 **The pot is LIVE!** 🔥🐺\n"
+        f"**Tickets Sold: {sold_count}/{max_users}**\n\n"
+        "Your destiny is just a click away. Select your lucky number and secure your spot in today's prize draw.\n\n"
+        "**Legend:**\n"
+        "🍀 - Available Tickets (Your opportunity)\n"
+        "🔒 - Sold Tickets (Missed chance)\n\n"
+        "This is not a game of chance, it's a game of speed. The pot is filling fast! Don't get left behind! 🚀"
+    )
+
+    await message.reply(
+        message_text,
+        reply_markup=reply_markup
+    )
+
+    await state.set_state(UserStates.CHOOSING_TICKET)
+
+
+async def process_ticket_selection(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer()
+
+    ticket_code = call.data.split('_')[2]
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
+    ticket_price = current_pot.get('ticket_price', 50.0)
+
+    if user.get('real_balance', 0.0) + user.get('bonus_balance', 0.0) < ticket_price:
+        await call.message.edit_text(
+            f"💸 Oh no! Your total balance (`Real: ₹{user.get('real_balance', 0.0):.2f}, Bonus: ₹{user.get('bonus_balance', 0.0):.2f}`) "
+            f"is not enough to buy ticket `{ticket_code}` for `₹{ticket_price:.2f}`.\n\n"
+            f"Please recharge your wallet with /wallet first, then try again."
+        )
+        await state.clear()
+        return
+
+    await state.update_data(chosen_ticket=ticket_code)
+
+    bonus_balance = user.get('bonus_balance', 0.0)
+    keyboard = []
+
+    if bonus_balance >= 30:
+        keyboard.append([InlineKeyboardButton(text="Use ₹30 from Bonus", callback_data=f"select_bonus_30")])
+    if bonus_balance >= 20:
+        keyboard.append([InlineKeyboardButton(text="Use ₹20 from Bonus", callback_data=f"select_bonus_20")])
+    if bonus_balance >= 10:
+        keyboard.append([InlineKeyboardButton(text="Use ₹10 from Bonus", callback_data=f"select_bonus_10")])
+
+    if user.get('real_balance', 0.0) >= ticket_price:
+        keyboard.append([InlineKeyboardButton(text="Use only Real Cash", callback_data=f"select_bonus_0")])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    await call.message.edit_text(
+        "💰 **How would you like to pay for ticket `{}`?**\n\n"
+        "Your balance: `Real: ₹{:.2f}, Bonus: ₹{:.2f}`\n"
+        "Ticket Price: `₹{:.2f}`\n\n"
+        "Please select a payment method below.".format(
+            ticket_code, user.get('real_balance', 0.0), user.get('bonus_balance', 0.0), ticket_price
+        ),
+        reply_markup=reply_markup
+    )
+
+    await state.set_state(UserStates.CHOOSING_BONUS)
+
+
+async def process_bonus_selection_and_buy(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer("Finalizing your purchase...")
+
+    state_data = await state.get_data()
+    ticket_code = state_data.get('chosen_ticket')
+
+    if not ticket_code:
+        await call.message.edit_text("❌ An error occurred. Please try the /buyticket command again.")
+        await state.clear()
+        return
+
+    selected_bonus_amount = int(call.data.split('_')[2])
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
+    ticket_price = current_pot.get('ticket_price', 50.0)
+
+    bonus_to_use = min(selected_bonus_amount, user.get('bonus_balance', 0.0))
+    real_needed = ticket_price - bonus_to_use
+
+    if user.get('real_balance', 0.0) < real_needed:
+        await call.message.edit_text(f"💸 You don't have enough real balance to cover this. You need ₹{real_needed:.2f} more. Please recharge your wallet with /wallet.")
+        await state.clear()
+        return
+
+    purchase_success = await purchase_ticket_atomically(db, current_pot['_id'], user_id, ticket_code)
+
+    if not purchase_success:
+        await call.message.edit_text(f"Oh no! Ticket `{ticket_code}` was just sold. Please choose another ticket from the list below.")
+        await state.clear()
+        await buyticket_command(call.message, db, admin_id, main_channel_id, ist_timezone, state)
+        return
+
+    await update_user_balance(db, user_id, real_amount=-real_needed, bonus_amount=-bonus_to_use)
+    await update_user_ticket(db, user_id, ticket_code)
+
+    try:
+        user_id_str = str(user.get('telegram_id'))
+        image_path = generate_ticket_image(code=ticket_code, user_id=user_id_str, referral_name=None)
+
+        if image_path and os.path.exists(image_path):
+            await call.message.answer_photo(photo=FSInputFile(image_path))
+            os.remove(image_path)
+
+        await call.message.answer(
+            f"🎉 **CONGRATULATIONS!** 🎉\n"
+            f"Your lucky ticket `{ticket_code}` is now in the draw!\n"
+            f"You've taken the first step towards a win. Good luck! 🍀"
+        )
+    except Exception as e:
+        logger.error(f"Error during image generation for user {user_id}: {e}", exc_info=True)
+        await call.message.edit_text(
+            f"🎉 Success! You've got your lucky ticket for today! 🎉\n"
+            f"Your ticket code: `{ticket_code}`\n"
+            f"Used: ₹{bonus_to_use:.2f} (Bonus) + ₹{real_needed:.2f} (Real)\n"
+            f"Good luck! The draw happens automatically shortly after the pot closes. 🍀"
+        )
+
+
+    filled_count = len(current_pot.get('participants', [])) + 1
+    max_users = current_pot.get('max_users', 30)
+    if filled_count == max_users:
+        await call.bot.send_message(admin_id, f"🔔 **ATTENTION ADMIN!** The pot is now FULL! ({filled_count}/{max_users} users).")
+
+    await state.clear()
+
+
+async def handle_sold_ticket_click(call: types.CallbackQuery):
+    await call.answer("This ticket is already sold. Please select an available one.", show_alert=True)
 
 
 @check_channel_membership_decorator
@@ -510,7 +929,7 @@ async def help_command(message: types.Message, db, admin_id, main_channel_id, is
         "🤔 **How to Play LuckyDrop Bot:**\n\n"
         "1.  **Daily Pot:** A new lottery pot opens every day from **5:00 PM to 7:00 PM IST**. 🕰️\n"
         "2.  **Buy a Ticket:** Use `/buyticket` to purchase your lucky entry. Each ticket costs **₹50**. "
-        "You can use up to **₹30 from your bonus balance** and the rest from your real balance. Only one ticket per user per day!\n"
+        "You can use up to **₹30 from your bonus balance** and the rest from your real balance. **Only one ticket per user per pot!**\n"
         "3.  **Unique Code:** Every ticket has a **unique 6-digit code**.\n"
         "4.  **Wallet:** Check your `real_balance` and `bonus_balance` with `/wallet`. Recharge your real balance manually by paying via the Cashfree link and submitting your payment details for admin approval.\n"
         "5.  **Refer & Earn:** Share your unique referral link (get it with `/refer`). When a friend joins via your link, "
@@ -519,12 +938,12 @@ async def help_command(message: types.Message, db, admin_id, main_channel_id, is
         "7.  **UPI Payouts:** Winners get paid directly to their UPI ID. Use `/setupi` to register or update your UPI ID. **Payouts are processed within 12 hours of results!**\n\n"
         "🏆 **Winning Rules (Draw after 7:00 PM IST):**\n"
         "-   **Less than 10 users:** Everyone gets a full refund to their **real** wallet. No hard feelings! ↩️\n"
-        "-   **10 to 29 users:** Prizes scale proportionally. The more participants, the bigger the scaled prize! 📈\n"
+        "-   **10 to 29 users:** Prizes scale proportionally. If you want to know more about the scaled prizes read the previous logs\n"
         "-   **30 users (Full Pot):**\n"
         "   🥇 1st Prize: ₹500\n"
         "   🥈 2nd: ₹200\n"
         "   🥉 3rd: ₹100\n\n"
-        "Winners are chosen **fairly and randomly** by the system and announced automatically shortly after the pot closes. Keep an eye out! 👀\n\n"
+        "Winners are chosen **fairly and randomly from all SOLD tickets** by the system and announced automatically shortly after the pot closes. Keep an eye out! 👀\n\n"
         "Got it? Let's get lucky! ✨"
     )
     await message.reply(help_text)
@@ -575,7 +994,305 @@ async def confirm_upi_callback(call: types.CallbackQuery, state: FSMContext, db,
     new_upi_id = user_data.get('new_upi_id')
 
     if call.data == "confirm_upi_yes" and new_upi_id:
+        current_user = await get_user(db, user_id)
+        current_upi = current_user.get('upi_id')
+
         await update_user_upi(db, user_id, new_upi_id)
+
+        pending_payout = await get_pending_payout_for_user(db, user_id, window_hours=10)
+
+        if pending_payout:
+            username = current_user.get('username')
+            if username:
+                user_name_display = escape_markdown_v2(username)
+            else:
+                user_name_display = f"User {user_id}"
+
+            try:
+                admin_message = (
+                    f"🔔 **URGENT: WINNER'S UPI ID UPDATED!** 🔔\n\n"
+                    f"**User:** [{user_name_display}](tg://user?id={user_id})\n"
+                    f"**New UPI ID:** `{escape_markdown_v2(new_upi_id)}`\n"
+                    f"**Prize Amount:** ₹{pending_payout['amount']:.2f}\n"
+                    f"Please process this payout manually. The user's UPI ID has been set/updated within the 10-hour window."
+                )
+                await call.bot.send_message(admin_id, admin_message, parse_mode='Markdown')
+            except Exception as e:
+                logger.error(f"Failed to notify admin about UPI update for winner {user_id}: {e}")
+
+        await call.message.edit_text(f"🎉 Your UPI ID has been set to: `{escape_markdown_v2(new_upi_id)}`\n"
+                                     "You're all set for payouts! 💰", parse_mode='Markdown')
+        logger.info(f"User {user_id} confirmed and set UPI ID: {new_upi_id}")
+    else:
+        await call.message.edit_text("UPI ID not confirmed. Please send your UPI ID again if you wish to set it.")
+        await state.set_state(UserStates.WAITING_FOR_UPI_ID)
+
+    await state.clear()
+
+
+async def process_ticket_selection(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer()
+
+    ticket_code = call.data.split('_')[2]
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
+    ticket_price = current_pot.get('ticket_price', 50.0)
+
+    if user.get('real_balance', 0.0) + user.get('bonus_balance', 0.0) < ticket_price:
+        await call.message.edit_text(
+            f"💸 Oh no! Your total balance (`Real: ₹{user.get('real_balance', 0.0):.2f}, Bonus: ₹{user.get('bonus_balance', 0.0):.2f}`) "
+            f"is not enough to buy ticket `{ticket_code}` for `₹{ticket_price:.2f}`.\n\n"
+            f"Please recharge your wallet with /wallet first, then try again."
+        )
+        await state.clear()
+        return
+
+    await state.update_data(chosen_ticket=ticket_code)
+
+    bonus_balance = user.get('bonus_balance', 0.0)
+    keyboard = []
+
+    if bonus_balance >= 30:
+        keyboard.append([InlineKeyboardButton(text="Use ₹30 from Bonus", callback_data=f"select_bonus_30")])
+    if bonus_balance >= 20:
+        keyboard.append([InlineKeyboardButton(text="Use ₹20 from Bonus", callback_data=f"select_bonus_20")])
+    if bonus_balance >= 10:
+        keyboard.append([InlineKeyboardButton(text="Use ₹10 from Bonus", callback_data=f"select_bonus_10")])
+
+    if user.get('real_balance', 0.0) >= ticket_price:
+        keyboard.append([InlineKeyboardButton(text="Use only Real Cash", callback_data=f"select_bonus_0")])
+
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+    await call.message.edit_text(
+        "💰 **How would you like to pay for ticket `{}`?**\n\n"
+        "Your balance: `Real: ₹{:.2f}, Bonus: ₹{:.2f}`\n"
+        "Ticket Price: `₹{:.2f}`\n\n"
+        "Please select a payment method below.".format(
+            ticket_code, user.get('real_balance', 0.0), user.get('bonus_balance', 0.0), ticket_price
+        ),
+        reply_markup=reply_markup
+    )
+
+    await state.set_state(UserStates.CHOOSING_BONUS)
+
+
+async def process_bonus_selection_and_buy(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer("Finalizing your purchase...")
+
+    state_data = await state.get_data()
+    ticket_code = state_data.get('chosen_ticket')
+
+    if not ticket_code:
+        await call.message.edit_text("❌ An error occurred. Please try the /buyticket command again.")
+        await state.clear()
+        return
+
+    selected_bonus_amount = int(call.data.split('_')[2])
+    user_id = call.from_user.id
+
+    user = await get_user(db, user_id)
+    current_pot = await get_current_pot(db, ist_timezone)
+    ticket_price = current_pot.get('ticket_price', 50.0)
+
+    bonus_to_use = min(selected_bonus_amount, user.get('bonus_balance', 0.0))
+    real_needed = ticket_price - bonus_to_use
+
+    if user.get('real_balance', 0.0) < real_needed:
+        await call.message.edit_text(f"💸 You don't have enough real balance to cover this. You need ₹{real_needed:.2f} more. Please recharge your wallet with /wallet.")
+        await state.clear()
+        return
+
+    purchase_success = await purchase_ticket_atomically(db, current_pot['_id'], user_id, ticket_code)
+
+    if not purchase_success:
+        await call.message.edit_text(f"Oh no! Ticket `{ticket_code}` was just sold. Please choose another ticket from the list below.")
+        await state.clear()
+        await buyticket_command(call.message, db, admin_id, main_channel_id, ist_timezone, state)
+        return
+
+    await update_user_balance(db, user_id, real_amount=-real_needed, bonus_amount=-bonus_to_use)
+    await update_user_ticket(db, user_id, ticket_code)
+
+    try:
+        user_id_str = str(user.get('telegram_id'))
+        image_path = generate_ticket_image(code=ticket_code, user_id=user_id_str, referral_name=None)
+
+        if image_path and os.path.exists(image_path):
+            await call.message.answer_photo(photo=FSInputFile(image_path))
+            os.remove(image_path)
+
+        await call.message.answer(
+            f"🎉 **CONGRATULATIONS!** 🎉\n"
+            f"Your lucky ticket `{ticket_code}` is now in the draw!\n"
+            f"You've taken the first step towards a win. Good luck! 🍀"
+        )
+    except Exception as e:
+        logger.error(f"Error during image generation for user {user_id}: {e}", exc_info=True)
+        await call.message.edit_text(
+            f"🎉 Success! You've got your lucky ticket for today! 🎉\n"
+            f"Your ticket code: `{ticket_code}`\n"
+            f"Used: ₹{bonus_to_use:.2f} (Bonus) + ₹{real_needed:.2f} (Real)\n"
+            f"Good luck! The draw happens automatically shortly after the pot closes. 🍀"
+        )
+
+
+    filled_count = len(current_pot.get('participants', [])) + 1
+    max_users = current_pot.get('max_users', 30)
+    if filled_count == max_users:
+        await call.bot.send_message(admin_id, f"🔔 **ATTENTION ADMIN!** The pot is now FULL! ({filled_count}/{max_users} users).")
+
+    await state.clear()
+
+
+async def handle_sold_ticket_click(call: types.CallbackQuery):
+    await call.answer("This ticket is already sold. Please select an available one.", show_alert=True)
+
+
+@check_channel_membership_decorator
+async def refer_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /refer called by {message.from_user.id}")
+    user = await get_user(db, message.from_user.id)
+    if not user:
+        await message.reply("Please use /start to register first. 🤖")
+        return
+
+    referral_code = user.get('referral_code', f"LUCKY{user['telegram_id']}")
+
+    bot_info = await message.bot.get_me()
+    referral_link = f"https://t.me/{bot_info.username}?start={referral_code}"
+
+    referral_count = user.get('referral_count', 0)
+
+    escaped_referral_code_display = escape_markdown_v2(referral_code)
+    clickable_referral_link_text = escape_markdown_v2("Click here to invite!")
+    clickable_referral_link = f"[{clickable_referral_link_text}]({referral_link})"
+
+    final_message_text = (
+        f"🤝 Share the luck! Refer your friends and earn a **₹{REFERRAL_BONUS:.2f} bonus** for each friend "
+        f"who joins and buys their first ticket!\n\n"
+        f"Your unique referral code: `{escaped_referral_code_display}`\n"
+        f"Your referral link: {clickable_referral_link}\n\n"
+        f"You have successfully referred **{referral_count}** friends! 🚀"
+    )
+
+    await message.reply(
+        final_message_text,
+        disable_web_page_preview=False
+    )
+
+@check_channel_membership_decorator
+async def pot_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /pot called by {message.from_user.id}")
+    current_pot = await get_current_pot(db, ist_timezone)
+
+    if not current_pot:
+        await message.reply("⏳ There's no active pot right now. Ticket sales open daily from **5:00 PM to 7:00 PM IST!** Get ready! 🔔")
+        return
+
+    pot_status_message = await get_current_pot_status(pot_data=current_pot, db=db, ist_timezone=ist_timezone)
+    await message.reply(pot_status_message)
+
+@check_channel_membership_decorator
+async def help_command(message: types.Message, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /help called by {message.from_user.id}")
+    help_text = (
+        "🤔 **How to Play LuckyDrop Bot:**\n\n"
+        "1.  **Daily Pot:** A new lottery pot opens every day from **5:00 PM to 7:00 PM IST**. 🕰️\n"
+        "2.  **Buy a Ticket:** Use `/buyticket` to purchase your lucky entry. Each ticket costs **₹50**. "
+        "You can use up to **₹30 from your bonus balance** and the rest from your real balance. **Only one ticket per user per pot!**\n"
+        "3.  **Unique Code:** Every ticket has a **unique 6-digit code**.\n"
+        "4.  **Wallet:** Check your `real_balance` and `bonus_balance` with `/wallet`. Recharge your real balance manually by paying via the Cashfree link and submitting your payment details for admin approval.\n"
+        "5.  **Refer & Earn:** Share your unique referral link (get it with `/refer`). When a friend joins via your link, "
+        "starts the bot, and buys their first ticket, you get a **₹10 bonus!** 🤝\n"
+        "6.  **Pot Status:** See how many tickets are sold with `/pot`.\n"
+        "7.  **UPI Payouts:** Winners get paid directly to their UPI ID. Use `/setupi` to register or update your UPI ID. **Payouts are processed within 12 hours of results!**\n\n"
+        "🏆 **Winning Rules (Draw after 7:00 PM IST):**\n"
+        "-   **Less than 10 users:** Everyone gets a full refund to their **real** wallet. No hard feelings! ↩️\n"
+        "-   **10 to 29 users:** Prizes scale proportionally. If you want to know more about the scaled prizes read the previous logs\n"
+        "-   **30 users (Full Pot):**\n"
+        "   🥇 1st Prize: ₹500\n"
+        "   🥈 2nd: ₹200\n"
+        "   🥉 3rd: ₹100\n\n"
+        "Winners are chosen **fairly and randomly from all SOLD tickets** by the system and announced automatically shortly after the pot closes. Keep an eye out! 👀\n\n"
+        "Got it? Let's get lucky! ✨"
+    )
+    await message.reply(help_text)
+
+@check_channel_membership_decorator
+async def setupi_command(message: types.Message, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    logger.info(f"Handler for /setupi called by {message.from_user.id}")
+    user = await get_user(db, message.from_user.id)
+    if not user:
+        await message.reply("Please use /start to register first. 🤖")
+        return
+
+    current_upi = user.get('upi_id')
+    if current_upi:
+        await message.reply(f"Your current UPI ID is: `{escape_markdown_v2(current_upi)}`\n"
+                            "Do you want to update it? Please send your new UPI ID now.", parse_mode='Markdown')
+    else:
+        await message.reply("Please send your UPI ID (e.g., `yourname@bank` or `phonenumber@upi`).\n"
+                            "This is where your winnings will be sent! 💰", parse_mode='Markdown')
+
+    await state.set_state(UserStates.WAITING_FOR_UPI_ID)
+
+async def process_upi_input(message: types.Message, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    user_id = message.from_user.id
+    upi_id_raw = message.text.strip()
+
+    if not re.match(r"^[\w.\-]{2,}@[a-zA-Z]{2,}$", upi_id_raw):
+        await message.reply("That doesn't look like a valid UPI ID format. Please try again.\n"
+                            "Example: `yourname@bank` or `phonenumber@upi`\n"
+                            "Make sure it contains an `@` symbol and a dot (`.`) in the domain part.", parse_mode='Markdown')
+        return
+
+    await state.update_data(new_upi_id=upi_id_raw)
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, confirm", callback_data=f"confirm_upi_yes")],
+        [InlineKeyboardButton(text="❌ No, re-enter", callback_data=f"confirm_upi_no")]
+    ])
+
+    await message.reply(f"You entered: `{escape_markdown_v2(upi_id_raw)}`\n"
+                        "Is this correct? Once confirmed, this will be used for your payouts.", reply_markup=markup, parse_mode='Markdown')
+    await state.set_state(UserStates.CONFIRM_UPI_ID)
+
+async def confirm_upi_callback(call: types.CallbackQuery, state: FSMContext, db, admin_id, main_channel_id, ist_timezone):
+    await call.answer()
+    user_id = call.from_user.id
+    user_data = await state.get_data()
+    new_upi_id = user_data.get('new_upi_id')
+
+    if call.data == "confirm_upi_yes" and new_upi_id:
+        current_user = await get_user(db, user_id)
+        current_upi = current_user.get('upi_id')
+
+        await update_user_upi(db, user_id, new_upi_id)
+
+        pending_payout = await get_pending_payout_for_user(db, user_id, window_hours=10)
+
+        if pending_payout:
+            username = current_user.get('username')
+            if username:
+                user_name_display = escape_markdown_v2(username)
+            else:
+                user_name_display = f"User {user_id}"
+
+            try:
+                admin_message = (
+                    f"🔔 **URGENT: WINNER'S UPI ID UPDATED!** 🔔\n\n"
+                    f"**User:** [{user_name_display}](tg://user?id={user_id})\n"
+                    f"**New UPI ID:** `{escape_markdown_v2(new_upi_id)}`\n"
+                    f"**Prize Amount:** ₹{pending_payout['amount']:.2f}\n"
+                    f"Please process this payout manually. The user's UPI ID has been set/updated within the 10-hour window."
+                )
+                await call.bot.send_message(admin_id, admin_message, parse_mode='Markdown')
+            except Exception as e:
+                logger.error(f"Failed to notify admin about UPI update for winner {user_id}: {e}")
+
         await call.message.edit_text(f"🎉 Your UPI ID has been set to: `{escape_markdown_v2(new_upi_id)}`\n"
                                      "You're all set for payouts! 💰", parse_mode='Markdown')
         logger.info(f"User {user_id} confirmed and set UPI ID: {new_upi_id}")

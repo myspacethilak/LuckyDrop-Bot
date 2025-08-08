@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 import logging
 import pytz
+from bson.objectid import ObjectId
 
 from bot_config import MONGO_URI, UTC_TIMEZONE, IST_TIMEZONE
 
@@ -13,6 +14,9 @@ async def init_db(db):
     await db.users.create_index("referral_code", unique=True)
     await db.pots.create_index("date", unique=True)
     await db.tickets.create_index("code", unique=True)
+    await db.payouts.create_index("user_telegram_id")
+    await db.payouts.create_index("status")
+    await db.payouts.create_index([("status", 1), ("timestamp", 1)])
     logger.info("MongoDB indexes created/ensured.")
 
 async def get_user(db, telegram_id: int):
@@ -78,6 +82,117 @@ async def add_recharge_to_history(db, telegram_id: int, amount: float, status: s
         {"$push": {"recharge_history": recharge_data}}
     )
     logger.info(f"Recharge history updated for user {telegram_id}")
+
+async def get_pending_recharge_for_user(db, telegram_id: int):
+    """
+    Finds the last pending recharge for a given user using $elemMatch for precision.
+    """
+    user = await db.users.find_one(
+        {"telegram_id": telegram_id, "recharge_history": {"$elemMatch": {"status": "PENDING_MANUAL"}}},
+        {"recharge_history": 1, "_id": 0}
+    )
+    if user and user.get('recharge_history'):
+        pending_recharges = [r for r in user['recharge_history'] if r['status'] == "PENDING_MANUAL"]
+        return pending_recharges[-1] if pending_recharges else None
+    return None
+
+async def update_recharge_status(db, telegram_id: int, order_id: str, new_status: str, amount: float):
+    """
+    Updates the status and amount of a specific recharge in a user's history.
+    """
+    result = await db.users.update_one(
+        {"telegram_id": telegram_id, "recharge_history.order_id": order_id},
+        {"$set": {"recharge_history.$.status": new_status, "recharge_history.$.amount": amount}}
+    )
+    return result.modified_count > 0
+
+async def add_payout_history(db, user_id, pot_id, amount, status, upi_id):
+    """
+    Adds a payout entry to the payout history collection.
+    """
+    payout_data = {
+        "user_telegram_id": user_id,
+        "pot_id": pot_id,
+        "amount": amount,
+        "status": status,
+        "upi_id": upi_id,
+        "timestamp": datetime.now(UTC_TIMEZONE),
+    }
+    await db.payouts.insert_one(payout_data)
+    logger.info(f"Payout history added for user {user_id} in pot {pot_id}.")
+
+async def get_pending_payouts(db):
+    """
+    Retrieves all pending payouts.
+    """
+    return await db.payouts.find({"status": "PENDING"}).to_list(length=None)
+
+async def get_pending_payouts_without_upi(db):
+    """
+    Retrieves all pending payouts where the UPI ID is not set.
+    """
+    return await db.payouts.find({
+        "status": "PENDING",
+        "upi_id": "Not set"
+    }).to_list(length=None)
+
+async def update_payout_status(db, payout_id, new_status: str, admin_id: int = None):
+    """
+    Updates the status of a payout in the payouts collection.
+    """
+    result = await db.payouts.update_one(
+        {"_id": ObjectId(payout_id)},
+        {"$set": {
+            "status": new_status,
+            "admin_id": admin_id,
+            "processed_at": datetime.now(UTC_TIMEZONE)
+        }}
+    )
+    return result.modified_count > 0
+
+async def get_pending_payout_for_user(db, user_id: int, window_hours: int):
+    """
+    Finds a pending payout for a user within a specified time window.
+    """
+    time_cutoff = datetime.now(UTC_TIMEZONE) - timedelta(hours=window_hours)
+    return await db.payouts.find_one({
+        "user_telegram_id": user_id,
+        "status": "PENDING",
+        "timestamp": {"$gte": time_cutoff}
+    })
+
+async def get_available_tickets(db, pot_id):
+    """
+    Retrieves all available ticket codes for a given pot.
+    """
+    pot = await db.pots.find_one({"_id": pot_id})
+    if not pot:
+        return []
+
+    sold_tickets = {p['ticket_code'] for p in pot.get('participants', [])}
+    all_ticket_docs = await db.tickets.find({"pot_id": pot_id}).to_list(length=None)
+
+    return [t['code'] for t in all_ticket_docs if t['code'] not in sold_tickets]
+
+async def purchase_ticket_atomically(db, pot_id, user_id, ticket_code):
+    """
+    Tries to purchase a ticket by adding a user to the pot, but only if the
+    ticket code is not already taken. Uses a race-condition-safe update.
+    Returns True on successful purchase, False on failure.
+    """
+    result = await db.pots.update_one(
+        {
+            "_id": pot_id,
+            "status": "open",
+            "participants": {"$not": {"$elemMatch": {"ticket_code": ticket_code}}},
+            "participants.telegram_id": {"$ne": user_id}
+        },
+        {
+            "$push": {"participants": {"telegram_id": user_id, "ticket_code": ticket_code}},
+            "$inc": {"total_tickets": 1}
+        }
+    )
+    return result.modified_count > 0
 
 async def get_pot_by_date(db, date_str: str):
     return await db.pots.find_one({"date": date_str})
