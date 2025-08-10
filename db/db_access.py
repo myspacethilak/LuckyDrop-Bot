@@ -161,6 +161,21 @@ async def get_pending_payout_for_user(db, user_id: int, window_hours: int):
         "timestamp": {"$gte": time_cutoff}
     })
 
+async def get_referred_users_details(db, referrer_id: int):
+    """
+    Retrieves details for all users referred by a given referrer.
+    """
+    referred_users = await db.users.find({"referred_by": referrer_id}).to_list(length=None)
+    details = []
+    for user in referred_users:
+        details.append({
+            "telegram_id": user['telegram_id'],
+            "username": user.get('username'),
+            "joined_date": user.get('joined_date'),
+            "bought_ticket": user['telegram_id'] in user.get('referred_users_tickets', [])
+        })
+    return details
+
 async def get_available_tickets(db, pot_id):
     """
     Retrieves all available ticket codes for a given pot.

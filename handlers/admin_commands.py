@@ -135,14 +135,14 @@ async def list_pending_payments_command(message: types.Message, db, admin_id, bo
                      InlineKeyboardButton(text="❌ Reject", callback_data=callback_data_reject)],
                 ])
                 await bot.send_message(message.chat.id,
-                    f"**🚨 Pending Payment**\n"
-                    f"User: [{escape_markdown_v2(user_name)}](tg://user?id={user_id})\n"
-                    f"Claimed Amount: ₹{amount:.2f}\n"
-                    f"Transaction ID: `{escape_markdown_v2(order_id)}`\n\n"
-                    f"Please verify this payment and choose an action.",
-                    reply_markup=markup,
-                    parse_mode='Markdown'
-                )
+                                       f"**🚨 Pending Payment**\n"
+                                       f"User: [{escape_markdown_v2(user_name)}](tg://user?id={user_id})\n"
+                                       f"Claimed Amount: ₹{amount:.2f}\n"
+                                       f"Transaction ID: `{escape_markdown_v2(order_id)}`\n\n"
+                                       f"Please verify this payment and choose an action.",
+                                       reply_markup=markup,
+                                       parse_mode='Markdown'
+                                       )
 
 async def list_pending_payouts_command(message: types.Message, db, admin_id, bot: Bot):
     pending_payouts = await db.payouts.find({"status": "PENDING"}).to_list(length=None)

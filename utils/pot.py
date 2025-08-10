@@ -48,17 +48,36 @@ async def create_pot(db, target_date_ist: datetime.date, max_users: int = None, 
     pot_data['_id'] = result.inserted_id
     logger.info(f"New pot created for IST date {target_date_ist.isoformat()} (UTC times: {pot_data['start_time']} - {pot_data['end_time']})")
 
+    # FIX: Scalable ticket generation based on pot size
     max_users_for_tickets = max_users if max_users is not None else DEFAULT_MAX_USERS
     tickets_to_insert = []
     generated_codes = set()
-    for _ in range(max_users_for_tickets):
-        new_code = _generate_unique_ticket_code_for_pot(generated_codes)
-        generated_codes.add(new_code)
-        tickets_to_insert.append({
-            "pot_id": pot_data['_id'],
-            "code": new_code,
-            "created_at": datetime.now(UTC_TIMEZONE)
-        })
+
+    if max_users_for_tickets <= 31:
+        # Generate tickets based on dates (01-31)
+        for i in range(1, max_users_for_tickets + 1):
+            date_prefix = f"{i:02d}"
+            while True:
+                random_suffix = ''.join(random.choices(string.digits, k=4))
+                new_code = date_prefix + random_suffix
+                if new_code not in generated_codes:
+                    generated_codes.add(new_code)
+                    tickets_to_insert.append({
+                        "pot_id": pot_data['_id'],
+                        "code": new_code,
+                        "created_at": datetime.now(UTC_TIMEZONE)
+                    })
+                    break
+    else:
+        # Generate entirely random 6-digit codes for larger pots
+        for _ in range(max_users_for_tickets):
+            new_code = _generate_unique_ticket_code_for_pot(generated_codes)
+            generated_codes.add(new_code)
+            tickets_to_insert.append({
+                "pot_id": pot_data['_id'],
+                "code": new_code,
+                "created_at": datetime.now(UTC_TIMEZONE)
+            })
 
     if tickets_to_insert:
         await db.tickets.insert_many(tickets_to_insert)
@@ -86,15 +105,15 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
         logger.info(f"Pot {pot_id} already revealed. Skipping revelation.")
         return
 
-    if num_participants < 2:
-        logger.info(f"Pot {pot_id}: Less than 2 participants ({num_participants}). Refunding all tickets.")
+    if num_participants < 10:
+        logger.info(f"Pot {pot_id}: Less than 10 participants ({num_participants}). Refunding all tickets.")
         for participant in participants:
             user_id = participant['telegram_id']
             user_data = await get_user(db, user_id)
             if user_data:
                 await update_user_balance(db, user_id, real_amount=ticket_price)
                 try:
-                    await bot.send_message(user_id, f"😢 Oh no! Today's LuckyDrop pot had less than 2 participants. Your **₹{ticket_price:.2f}** ticket price has been refunded to your real wallet. Better luck next time! 🍀")
+                    await bot.send_message(user_id, f"😢 Oh no! Today's LuckyDrop pot had less than 10 participants. Your **₹{ticket_price:.2f}** ticket price has been refunded to your real wallet. Better luck next time! 🍀")
                 except Exception as e:
                     logger.warning(f"Could not send refund message to user {user_id}: {e}")
             else:
@@ -103,12 +122,12 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
         await update_pot_status(db, pot_id, "revealed")
         if main_channel_id:
             try:
-                await bot.send_message(main_channel_id, f"😔 Today's LuckyDrop pot ({pot_date_str}) had less than 2 participants ({num_participants} users). All tickets have been refunded! Better luck next time! 🍀")
+                await bot.send_message(main_channel_id, f"😔 Today's LuckyDrop pot ({pot_date_str}) had less than 10 participants ({num_participants} users). All tickets have been refunded! Better luck next time! 🍀")
                 logger.info(f"Sent refund announcement to channel {main_channel_id}")
             except Exception as e:
                 logger.error(f"Failed to send refund announcement to channel {main_channel_id}: {e}")
 
-        await bot.send_message(admin_id, f"✅ Pot for {pot_date_str} closed due to <2 participants. All tickets refunded. Announcement sent to main channel.")
+        await bot.send_message(admin_id, f"✅ Pot for {pot_date_str} closed due to <10 participants. All tickets refunded. Announcement sent to main channel.")
         logger.info(f"Pot {pot_id} closed and refunds processed.")
         return
 
@@ -153,6 +172,9 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
     final_winners_for_db = []
     winner_messages_for_summary = []
 
+    # NEW: Admin payout summary message
+    admin_payouts_summary = ["🚨 **PAYOUTS TO PROCESS!** 🚨\n\n"]
+
     for i, rank_info in enumerate(winners_data_for_reveal):
         winner = rank_info["winner_obj"]
         prize = rank_info["prize"]
@@ -181,6 +203,24 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
         final_winners_for_db.append({"rank": rank_name, "telegram_id": winner['telegram_id'], "ticket_code": ticket_code, "prize": prize, "upi_id": winner_upi_id})
         winner_messages_for_summary.append(f"🏅 {rank_name.capitalize()}: [{winner_username_display}](tg://user?id={winner['telegram_id']}) (Ticket `{ticket_code}`) - ₹{prize:.2f} (UPI: `{escape_markdown_v2(winner_upi_id)}`)")
 
+        # NEW: Add payout info to the admin summary list
+        admin_payouts_summary.append(
+            f"**Winner:** [{winner_username_display}](tg://user?id={winner['telegram_id']})\n"
+            f"**Prize:** ₹{prize:.2f}\n"
+            f"**UPI ID:** `{escape_markdown_v2(winner_upi_id)}`\n"
+            f"**Pot ID:** `{str(pot_id)}`\n"
+            f"**Status:** PENDING\n"
+            "---"
+        )
+
+        # OLD: Removed the direct send_message call here to prevent duplicate messages
+        # The admin message is now collected into a single summary.
+
+        await add_payout_history(db, winner['telegram_id'], pot_id, prize, "PENDING", winner_upi_id)
+
+        if interactive_reveal:
+            await asyncio.sleep(2)
+
         try:
             if winner_user and winner_upi_id != "Not set":
                 winner_message_text = (
@@ -198,25 +238,10 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
         except Exception as e:
             logger.warning(f"Could not send winner message to {winner['telegram_id']}: {e}")
 
-        try:
-            admin_payout_message = (
-                f"🚨 **PAYOUT ALERT!** 🚨\n\n"
-                f"**Winner:** [{winner_username_display}](tg://user?id={winner['telegram_id']})\n"
-                f"**Prize:** ₹{prize:.2f}\n"
-                f"**UPI ID:** `{escape_markdown_v2(winner_upi_id)}`\n"
-                f"**Pot ID:** `{str(pot_id)}`\n"
-                f"**Status:** PENDING\n\n"
-                f"Please process this payout manually."
-            )
-            await bot.send_message(admin_id, admin_payout_message, parse_mode='Markdown')
-            logger.info(f"Admin notified about payout for winner {winner['telegram_id']}.")
-        except Exception as e:
-            logger.error(f"Failed to send admin payout message: {e}")
-
-        await add_payout_history(db, winner['telegram_id'], pot_id, prize, "PENDING", winner_upi_id)
-
-        if interactive_reveal:
-            await asyncio.sleep(2)
+    # NEW: Send the single admin payout summary message after the loop finishes
+    admin_payouts_summary.append("Please process these payouts manually.")
+    await bot.send_message(admin_id, "\n".join(admin_payouts_summary), parse_mode='Markdown')
+    logger.info(f"Admin notified about all payouts for pot {pot_id}.")
 
     final_winners_sorted_for_db = sorted(final_winners_for_db, key=lambda x: rank_order_map[x['rank']])
     await set_pot_winners(db, pot_id, final_winners_sorted_for_db)
@@ -243,7 +268,6 @@ async def process_pot_revelation(bot, db, admin_id: int, pot_data: dict, main_ch
 
     logger.info(f"Pot {pot_id} revelation completed.")
 
-# FIX: The scheduler logic is now dynamic and checks the pot's end_time
 async def schedule_daily_pot_open(bot, db, admin_id: int, main_channel_id: int, ist_timezone: pytz.BaseTzInfo, utc_timezone: pytz.BaseTzInfo):
     logger.info(f"Pot scheduler started. Default pot times: {DEFAULT_POT_START_HOUR}:00 - {DEFAULT_POT_END_HOUR}:00 IST")
     while True:
@@ -252,66 +276,47 @@ async def schedule_daily_pot_open(bot, db, admin_id: int, main_channel_id: int, 
         today_ist_date_str = today_ist_date.isoformat()
         pot_open_time_default_ist = ist_timezone.localize(datetime.combine(today_ist_date, time(DEFAULT_POT_START_HOUR, 0, 0)))
 
-        current_pot = await get_current_pot(db, ist_timezone)
+        # FIX: Check if a pot with an "open" status exists for today. This allows for multiple pots.
+        open_pot = await db.pots.find_one({"date": today_ist_date_str, "status": "open"})
+        closed_or_revealed_pot = await db.pots.find_one({"date": today_ist_date_str, "status": {"$in": ["closed", "revealed"]}})
 
-        if current_pot:
-            pot_end_time_ist = current_pot.get('end_time').astimezone(ist_timezone)
-            current_pot_status = current_pot.get('status')
-
-            # Case 1: Pot is open and it's past its end time
-            if current_pot_status == 'open' and now_ist >= pot_end_time_ist:
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is OPEN and it's past pot's end time. Closing pot.")
+        if open_pot:
+            pot_end_time_ist = open_pot.get('end_time').astimezone(ist_timezone)
+            if now_ist >= pot_end_time_ist:
+                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Open pot for {today_ist_date_str} is past its end time. Closing pot.")
+                await close_pot_and_distribute_prizes(bot, db, admin_id, open_pot['_id'], main_channel_id=main_channel_id)
+                await asyncio.sleep(60)
+            else:
+                logger.debug(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot is open but not yet time to close. Sleeping for 1 min.")
+                await asyncio.sleep(60)
+        elif closed_or_revealed_pot:
+            pot_end_time_ist = closed_or_revealed_pot.get('end_time').astimezone(ist_timezone)
+            if closed_or_revealed_pot.get('status') == 'closed' and now_ist >= pot_end_time_ist + timedelta(minutes=REVEAL_DELAY_MINUTES):
+                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is CLOSED and it's past auto-reveal time. Triggering auto-revelation.")
+                await process_pot_revelation(bot, db, admin_id, closed_or_revealed_pot, main_channel_id, ist_timezone, interactive_reveal=False)
+                await asyncio.sleep(3600)
+            else:
+                logger.debug(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is already closed or revealed. Waiting for next day.")
+                next_check_time_ist = ist_timezone.localize(datetime.combine(today_ist_date + timedelta(days=1), time(DEFAULT_POT_START_HOUR, 0, 0)))
+                sleep_seconds = (next_check_time_ist - now_ist).total_seconds()
+                await asyncio.sleep(max(60, sleep_seconds))
+        elif now_ist >= pot_open_time_default_ist and now_ist < pot_open_time_default_ist + timedelta(minutes=15): # Give a 15 min window to create the default pot
+            logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Current time is ON/AFTER 5PM IST and no pot exists. Creating a new one.")
+            new_pot = await create_pot(db, today_ist_date)
+            if new_pot:
                 try:
                     await bot.send_message(main_channel_id,
-                                           "⏳ **Time's up!** The LuckyDrop pot is now closed for ticket purchases! Results coming soon! 🎲",
+                                           "🔔 **POT ALERT!** A new LuckyDrop pot is now open for tickets! 🚀\n"
+                                           "Time to grab your ticket before 7:00 PM IST! Use /buyticket now! 🎫",
                                            parse_mode='Markdown')
-                    logger.info(f"Sent pot close announcement to channel {main_channel_id}")
+                    logger.info(f"Sent auto pot open announcement to channel {main_channel_id}")
                 except Exception as e:
-                    logger.error(f"Failed to send pot close announcement to channel {main_channel_id}: {e}")
-                await close_pot_and_distribute_prizes(bot, db, admin_id, current_pot['_id'], main_channel_id=main_channel_id)
-                await asyncio.sleep(60) # Wait a minute before checking again
-
-            # Case 2: Pot is closed and it's past the reveal time
-            elif current_pot_status == 'closed' and now_ist >= pot_end_time_ist + timedelta(minutes=REVEAL_DELAY_MINUTES):
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is CLOSED and it's past auto-reveal time. Triggering auto-revelation.")
-                await process_pot_revelation(bot, db, admin_id, current_pot, main_channel_id, ist_timezone, interactive_reveal=False)
-                await asyncio.sleep(3600) # Wait for an hour after reveal
-
-            # Case 3: Pot is already revealed, wait for tomorrow
-            elif current_pot_status == 'revealed':
-                logger.debug(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is already revealed. Waiting for tomorrow's pot.")
-                next_5pm_tomorrow_ist = ist_timezone.localize(datetime.combine(today_ist_date + timedelta(days=1), time(DEFAULT_POT_START_HOUR, 0, 0)))
-                sleep_seconds = (next_5pm_tomorrow_ist - now_ist).total_seconds()
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Sleeping for {sleep_seconds / 3600:.2f} hours until tomorrow's {DEFAULT_POT_START_HOUR} PM IST.")
-                await asyncio.sleep(max(60, sleep_seconds))
-
-            # Case 4: Pot is open, but it's not time to close yet
-            else:
-                logger.debug(f"[{now_ist.strftime('%H:%M:%S %Z')}] Pot for {today_ist_date_str} is open. Checking again in 1 min.")
-                await asyncio.sleep(60)
-
-        # Case 5: No pot exists for today yet
+                    logger.error(f"Failed to send auto pot open announcement to channel {main_channel_id}: {e}")
+                await bot.send_message(admin_id, f"🔔 Pot auto-opened for {today_ist_date_str}. Announcement sent to main channel. 🚀")
+            await asyncio.sleep(600)
         else:
-            if now_ist >= pot_open_time_default_ist:
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Current time is ON/AFTER 5PM IST and no pot exists. Creating a new one.")
-                new_pot = await create_pot(db, today_ist_date)
-                if new_pot:
-                    try:
-                        await bot.send_message(main_channel_id,
-                                               "🔔 **POT ALERT!** A new LuckyDrop pot is now open for tickets! 🚀\n"
-                                               "Time to grab your ticket before 7:00 PM IST! Use /buyticket now! 🎫",
-                                               parse_mode='Markdown')
-                        logger.info(f"Sent auto pot open announcement to channel {main_channel_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to send auto pot open announcement to channel {main_channel_id}: {e}")
-                    await bot.send_message(admin_id, f"🔔 Pot auto-opened for {today_ist_date_str}. Announcement sent to main channel. 🚀")
-                await asyncio.sleep(600)
-            else:
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Current time is BEFORE 5PM IST. Waiting for pot opening.")
-                next_check_time_ist = pot_open_time_default_ist
-                sleep_seconds = (next_check_time_ist - now_ist).total_seconds()
-                logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Sleeping for {sleep_seconds / 3600:.2f} hours until {DEFAULT_POT_START_HOUR} PM IST.")
-                await asyncio.sleep(max(60, sleep_seconds))
+            logger.info(f"[{now_ist.strftime('%H:%M:%S %Z')}] Waiting for pot opening or checking next day. Sleeping for 1 min.")
+            await asyncio.sleep(60)
 
 async def send_payout_reminders(bot, db):
     """

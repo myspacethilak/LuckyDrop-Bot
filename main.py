@@ -24,10 +24,10 @@ from bot_config import (
 )
 
 # Import other modules from new locations
-from db.db_access import init_db, get_user
+from db.db_access import init_db
 from handlers.user_commands import register_user_handlers, UserStates
 from handlers.admin_commands import register_admin_handlers, AdminStates
-from utils.pot import close_pot_and_distribute_prizes, schedule_daily_pot_open, get_current_pot, send_payout_reminders
+from utils.pot import close_pot_and_distribute_prizes, schedule_daily_pot_open, get_current_pot
 from utils.payment import cashfree_webhook_handler
 
 # Configure logging
@@ -49,7 +49,6 @@ db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client.lotterydb
 
 pot_scheduler_task = None
-payout_reminder_task = None
 
 def log_unhandled_exceptions(exctype, value, tb):
     with open('error.log', 'a') as f:
@@ -67,7 +66,6 @@ async def set_default_commands(bot: Bot):
         BotCommand(command="pot", description="📊 See current pot status"),
         BotCommand(command="help", description="❓ Learn how to play"),
         BotCommand(command="setupi", description="Set or update your UPI ID"),
-        BotCommand(command="recharge_status", description="Check status of your recharge"),
     ]
     await bot.set_my_commands(commands)
 
@@ -90,7 +88,7 @@ async def close_overdue_pots_on_startup(db, bot, ist_timezone: pytz.BaseTzInfo, 
 
 
 async def on_startup(dispatcher: Dispatcher, bot: Bot):
-    global pot_scheduler_task, payout_reminder_task
+    global pot_scheduler_task
 
     dispatcher['db'] = db
     dispatcher['admin_id'] = ADMIN_ID
@@ -117,8 +115,7 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot):
     logger.info("Default commands set.")
 
     pot_scheduler_task = asyncio.create_task(schedule_daily_pot_open(bot, db, ADMIN_ID, MAIN_CHANNEL_ID, IST_TIMEZONE, UTC_TIMEZONE))
-    payout_reminder_task = asyncio.create_task(send_payout_reminders(bot, db))
-    logger.info("Scheduler tasks started.")
+    logger.info("Pot scheduler task started.")
 
     await close_overdue_pots_on_startup(db, bot, IST_TIMEZONE, UTC_TIMEZONE)
 
@@ -129,15 +126,9 @@ async def on_shutdown(dispatcher: Dispatcher, bot: Bot):
         pot_scheduler_task.cancel()
         try:
             await pot_scheduler_task
+            logger.info("Pot scheduler task was cancelled.")
         except asyncio.CancelledError:
             logger.info("Pot scheduler task was cancelled.")
-
-    if payout_reminder_task and not payout_reminder_task.done():
-        payout_reminder_task.cancel()
-        try:
-            await payout_reminder_task
-        except asyncio.CancelledError:
-            logger.info("Payout reminder task was cancelled.")
 
     db_client.close()
     logger.info("MongoDB connection closed.")
@@ -164,3 +155,4 @@ if __name__ == '__main__':
     dp.shutdown.register(on_shutdown)
 
     asyncio.run(main())
+    #hi
